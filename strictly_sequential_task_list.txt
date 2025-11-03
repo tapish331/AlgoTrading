@@ -1,0 +1,329 @@
+
+> Per README, `--stage <name>` is **deprecated**; don’t add new stage names. Prefer the unified interval-based CLI (for `fetch`) and `--fn` callers where applicable. Stage entries shown here are for backward compatibility only.
+STRICTLY SEQUENTIAL TASK LIST — 1:1 with README (LIVE, no stubs/fakes/mocks)
+NOTE ON [ADD] TAGS: Items marked with [ADD] are non-functional clarifications meant purely for guidance; they do not change scope or introduce deviations from README.
+
+
+Goal: implement a production‑ready pipeline that exactly matches the README’s public interface and guarantees.
+
+—
+1) Bootstrap & Environment (MUST MATCH README)
+- **Broker mode (required):** choose one of {`kite_sdk`, `raw_http`} and ensure deps are pinned (`kiteconnect` for SDK, or `httpx` + a WebSocket client for raw). Do **not** ship without one configured.
+   • Python 3.11.9 via pyenv; create .venv and install from a **hash-locked** requirements.txt (exact pins; no version ranges) using `pip install --require-hashes -r requirements.txt`.
+   • LOG_LEVEL default INFO; switchable via --verbose/--silent (last flag wins).
+• Trading windows are governed by `config["timezone"]` (default Asia/Kolkata). `TZ` only affects formatting. All on-disk timestamps are UTC.
+Deliverables:
+   □ .python-version (3.11.9) or explicit pyenv instructions
+   □ requirements.txt with exact, hash‑locked pins (no version ranges); install with `pip install --require-hashes -r requirements.txt`
+   □ `make bootstrap` or doc’d commands that reproduce the above
+
+—
+2) Repository Skeleton & Config
+   • Ensure entrypoints exist: fetch.py, train.py, trade.py, dashboard.py; plus broker.py, ml.py, data.py.
+   • Provide config.json template and .env template (ZERODHA_* keys, LOG_LEVEL, TZ).
+   • Centralize config/env loading with overrides.
+Deliverables:
+
+- Trading-day calendar: Prefer the exchange/broker holiday API. If offline fallback is desired, include `config/holidays-<year>.json` files conforming to the README schema.
+- **[ADD] Repository Skeleton & Config — Complete config schema**
+  - The `config.json` template **must include** all keys referenced in the README:
+    - `timezone`, `index`, `tickers`, `timeframes`, `lookbacks`, `from_dates`,
+      `safe_trading_start`, `safe_trading_end`, `hard_trading_end`,
+      `trailing_stop_r`, `capital_per_ticker`, `max_concurrent_trades`,
+      `paper_trading`, `holdout`, `actions` (`[BUY, SELL, HOLD]`),
+      and `paths` (keys **must** exist):
+**Template defaults for `paths`:**
+- `raw: data/raw`
+- `processed: data/processed`
+- `checkpoints: models/checkpoints`
+- `winner: models/winner`
+  - Clarify that NSE symbol refresh semantics for `tickers` must be honored.
+   □ Entry files present/importable
+   □ Sample .env and config.json templates
+
+—
+3) GLOBAL IO Contract (exact numbers)
+   • Retries: 5 on HTTP 429/5xx/timeouts (unless noted).
+   • Backoff: 0.5s, 1s, 2s, 4s, 8s (+ jitter 0–100ms).
+   • Per-request timeout: 10s (unless API says otherwise).
+   • DNS/connect/read timeouts: 3s / 5s / 5s.
+   • Throttle: ≥200ms between requests/pages.
+   • Broker heartbeat: every 5s; missed for 2 minutes → flatten & halt.
+Deliverables:
+   Optional: □ io.py (or equivalent) exporting these constants/helpers
+   Optional: demo/test showing retry/backoff policy in action.
+
+—
+• Exception — `ensure_access_token` (fetch.py): retries 3 on transient network errors with backoff 1s, 2s, 4s (per-request timeout 10s); no retry on 401/invalid credentials (fail fast) — as specified in the README.
+4) Data Contracts (on-disk LIVE storage)
+
+• Maintain `FEATURE_SPEC_VERSION`; bump it on any change to feature shape/order and fail fast on version mismatches in loaders.
+   • Raw candles → data/raw/{TICKER}/{TF}.parquet: columns [timestamp(UTC), open, high, low, close, volume, optional oi].
+   • Processed features → data/processed/{TICKER}/{TF}.parquet: [timestamp(UTC)] + f_* float32 standardized features.
+   • Guarantees: append → dedupe → sort (monotonic timestamp). No NaNs after imputation. OHLC constraints preserved.
+Deliverables:
+   □ Validation step that enforces schema & invariants
+   □ Deterministic append/dedupe/sort writer
+
+—
+
+—
+[ADD] 4b) data.py — API surface parity with README (names must exist exactly)
+   • Required functions with exact names/signatures:
+     - read_history(ticker: str, tf: str) -> "pd.DataFrame"
+     - write_history(df: "pd.DataFrame", ticker: str, tf: str) -> None
+     - resample_align(df: "pd.DataFrame", tf: str, tz: str) -> "pd.DataFrame"
+     - impute(df: "pd.DataFrame") -> "pd.DataFrame"
+     - feature_pipeline(df: "pd.DataFrame", cfg: dict) -> "np.ndarray"
+   • Behavior: must uphold the on-disk schema/invariants from 4) (UTC timestamps, OHLC constraints, NaN-free after imputation) and produce float32 feature arrays matching configured lookbacks/timeframes.
+Deliverables:
+   □ data.py exports all functions above
+   □ Validation enforces schema/invariants before write
+5) fetch.py — CLI flags, stages, and function callers EXACTLY as README
+- `persist_config(cfg, path)` **must** write atomically (UTF-8) and **preserve key order** exactly as described in the README Per-File API.
+   • Flags:
+  - `--to` defaults to 'now' if omitted.
+       --index TEXT
+       --from YYYY-MM-DD
+       --to   YYYY-MM-DD
+       --interval {1m,3m,5m,15m,1h,1d}
+       --symbols <comma-separated>
+       --force-refresh-token / --no-force-refresh-token
+       --max-workers INT
+       [index|token|history|impute|all]... (legacy; prefer --fn)  (repeatable)
+• CLI alias `ensure_token` MUST call API `ensure_access_token()`; the programmatic function name is `ensure_access_token` (no API named `ensure_token`).
+   • Behavior:
+       - index: LIVE HTTP with explicit User-Agent; respect robots.txt; retries/backoff with jitter as per GLOBAL IO.       - index: procure NSE constituents and persist to config.json; refreshes by default.
+       - token: validate/refresh Zerodha access tokens (prefer refresh flow).
+       - history: incremental candle download using existing_range; then append→dedupe→sort→persist.
+       - impute: NaN‑free imputation with OHLC invariants.
+Deliverables:
+  - Expose `get_index_tickers_from_nse(index: str) -> list[str]` with the LIVE semantics in README.
+  - Expose `fetch_history(ticker: str, tf: str, start: datetime, end: datetime) -> pd.DataFrame` (per-page timeout 20s; retries/backoff/throttle as specified).Return a UTC-indexed/typed DataFrame with columns `[timestamp, open, high, low, close, volume, (optional oi)]` and dtypes `{timestamp: datetime64[ns, UTC]; prices: float64; volume/oi: float64}`.
+
+  - Expose `impute(df: pd.DataFrame) -> pd.DataFrame` (NaN-free, OHLC-safe).
+- **[ADD] fetch.py — API surface parity with README**
+  - Expose the following functions with **exact** names and compatible signatures:
+    - `sync_instruments_cache(force: bool = False)`
+    - `existing_range(...)`
+    - `save_history(...)`
+
+   □ argparse/typer exposing the exact flags and allowlist above
+   □ Each whitelisted --fn callable exists and completes
+   □ `python fetch.py --help` shows the spec above
+
+—
+- Exception: `fetch_history` uses per-page timeout of 20s (still honors retry/backoff/throttle).
+6) ml.py — API surface (names must exist exactly)
+   • @dataclass Transition
+   • class ReplayMemory
+   • class DuelingDoubleDQN
+   • class Trainer
+   • class InferenceEngine
+   • def make_features(...)
+Deliverables:
+   □ DuelingDoubleDQN implements README architecture exactly: C_τ, K_τ, minimal D_τ per formulas; encoder→time pooling→fusion (M=ceil(sqrt(Z)))→market pooling+gate→dueling head.   □ `from ml import Transition, ReplayMemory, DuelingDoubleDQN, Trainer, InferenceEngine, make_features` works
+
+—
+7) train.py — CLI function callers EXACTLY as README (LIVE, no mocks)
+- **[ADD] train.py — API surface parity with README**
+  `train.py` **must export** these functions with the **exact names/signatures** from the README Per-File API:
+  `build_model(cfg)`, `load_checkpoint(model, path)`, `load_features(cfg)`, `populate_replay(cfg, holdout: bool)`, `backtrace_rewards(memory, cfg)`, `train_ddqn(model, memory, cfg)`, `evaluate(model, holdout)`, `maybe_promote_winner(metrics, ckpt_path, winner_dir)`, and `main()`.
+- `load_features(cfg)` must return `dict[str, dict[str, np.ndarray]]` where each ndarray is float32 and shaped according to the configured lookbacks/timeframes, matching the processed feature files’ contract.
+  **CLI → API mapping (must be exact):**
+  - `--fn build_model` → `build_model`
+  - `--fn load_ckpt` → `load_checkpoint`
+  - `--fn make_features` → uses `ml.make_features` as defined in `ml.py`; `train.py.load_features` remains the programmatic loader used by stages that need it
+  - `--fn make_train_replay` → `populate_replay(holdout=False)`
+  - `--fn make_holdout_replay` → `populate_replay(holdout=True)`
+  - `--fn backtrace_train` → `backtrace_rewards(train_memory, cfg)`
+  - `--fn backtrace_holdout` → `backtrace_rewards(holdout_memory, cfg)`
+  - `--fn fit` → `train_ddqn`
+  - `--fn eval` → `evaluate`
+  - `--fn promote` → `maybe_promote_winner`
+
+   • Flags/Stages/Allowlist:
+   • General flags: --steps INT | --batch-size INT | --lr FLOAT | --gamma FLOAT | --checkpoint-path PATH  # must appear in CLI --help       --stage features|populate-train|backtrace-train|train|populate-holdout|backtrace-holdout|evaluate|promote|all
+       --fn    build_model|load_ckpt|make_features|make_train_replay|backtrace_train|fit|make_holdout_replay|backtrace_holdout|eval|promote
+   • Use real on-disk features/history; promote to models/winner/ only on strict improvement.
+   • Replay construction follows README LIVE rules (a–g), including max‑confidence tie‑break and concurrency gates.   • Backtrace metrics: compute R, MAE(R), %MFE, IS, and Plan Adherence exactly per README and write them into Transition.meta for train and holdout replays.Deliverables:
+    □ CLI alias `load_ckpt` MUST invoke the API function `load_checkpoint` (name exactly per README Per-File API).
+   □ train.py exposes the exact allowlist above and runs end‑to‑end
+   □ `python train.py --help` documents each callable
+
+—
+- **[ADD] train.py — Default hyperparameters (overridable via CLI)**
+  - Defaults: AdamW(lr=3e-4, weight_decay=1e-4), Huber loss, `gamma=0.99`,
+    batch size `512`, gradient clip `1.0`, target network copy every `1,000` steps,
+    ε-greedy from `0.10 → 0.01` over `50k` steps.
+8) trade.py — CLI must match README (time-boxed end, not duration/timestamp)
+- infer(engine, features) must return {ticker: (action, confidence)} with confidence ∈ [0,1].
+   • Flags:
+
+- Precedence: CLI flags override `config.paper_trading`; if neither flag is provided, the config value is used. If both `--paper` and `--dry-run` are supplied, the last flag wins.
+       --paper   (mutually exclusive; CLI overrides config.paper_trading)
+       --dry-run
+       --loop-ms INT
+       --end HH:MM:SS  (interpreted in `config.timezone`). Do not accept duration values or absolute dates.
+          If `--end` is omitted, loop until today’s `hard_trading_end` (TZ: `config.timezone`).
+       [features|infer|loop|all]... (legacy; prefer --fn)
+       --fn load_winner|one_shot_quotes|one_shot_features|one_shot_infer|loop
+   • Deterministic gates:
+   • Exits: should_exit_long / should_exit_short must implement trailing‑stop conversion from R‑space to price‑space exactly as specified in README (using trailing_stop_r).       - Tie‑break for max‑confidence: prefer tickers with no active trade; else lexicographic.
+       - Entries only if active_trades < max_concurrent_trades and signal ∈ {BUY, SELL}.
+   • Order flow: idempotent client_id, partial‑fill polling, reduce-only exits, retry/backoff/timeouts per GLOBAL IO.
+
+□ Post-acceptance fill polling: **every 1s up to 90s** total; if not fully filled and **no fill delta for 15s**, attempt cancel/replace of the remainder (reuse same client_id unless a cancel/replace is required).
+Deliverables:
+- **[ADD] trade.py — Paper/Live precedence (verbatim from README)**
+  - **Live trading (default):** omit `--paper` and `--dry-run`.
+  - **Precedence:** CLI flags (`` / `--paper`) **override** `config.paper_trading`; if neither flag is provided, the **config value is used**. **Last flag wins** if both are present.
+- **[ADD] trade.py — Required export**
+  - Export `loop_until(end_time: datetime)` (name/signature must match the README).
+    □ `trade.py` MUST export the helper APIs named in README:
+       should_exit_long, should_exit_short, can_enter, enter_trade, exit_trade, portfolio_state,
+       fetch_realtime_quotes, build_live_features, infer, load_winner
+   □ trade.py matches the exact flags and allowlist above
+   □ Loop honors --loop-ms and flattens at HH:MM:SS or on kill‑switch
+
+—
+    □ Each loop iteration performs position reconciliation; on persistent inconsistency beyond threshold, flatten & halt.
+• `can_enter(...)` must be purely deterministic and side-effect free.
+9) dashboard.py — CLI & endpoints EXACTLY as README
+   • Flags:
+       --host TEXT
+--port INT
+       [ADD] Examples use --host 0.0.0.0 and --port 8000, but Default host is 127.0.0.1 and a bearer token via DASHBOARD_AUTH_TOKEN is required. To expose externally, explicitly set --host and put the service behind a reverse proxy with TLS.
+
+       [dump-metrics|all]
+       --fn serve|dump_metrics
+   • FastAPI routes: GET /, /trades, /metrics, /healthz, /readyz.
+   • /metrics must include training & holdout summaries and current winner model info.   • /trades must return per‑trade fields: R, MAE(R), %MFE, IS, and Plan Adherence.Deliverables:
+   □ `dashboard.py` exposes serve/dump_metrics. **Default binding must be localhost**:
+     - Default host: `127.0.0.1`
+     - Require `DASHBOARD_AUTH_TOKEN` (reject requests without `Authorization: Bearer <token>`)
+     - Compose example MUST map: `ports: ["127.0.0.1:8000:8000"]`
+   - [ADD] Examples use `--host 127.0.0.1 --port 8000`. **Default host is 127.0.0.1** and a bearer token via `DASHBOARD_AUTH_TOKEN` is required. To expose externally, explicitly opt in and place behind a TLS reverse proxy.
+GET / must render an overview including: equity curve, open positions, and recent trades (not just liveness). GET /trades, GET /metrics, GET /healthz, and GET /readyz remain mandatory.
+
+—10) Broker & Instruments
+   • broker.py ZerodhaClient implements token lifecycle, instruments master cache, historical/quotes, leverage, idempotent place/cancel/status, open_positions/exit.
+   • Heartbeat every 5s; missed 2 minutes → flatten & halt.
+Deliverables:
+- **[ADD] Broker & Instruments — Error & Auth semantics**
+  - Define `class BrokerError(Exception): ...` used for broker failures.
+  - On 401 Unauthorized responses: attempt **one** token refresh; if still unauthorized, raise `BrokerError` and halt trading.
+   □ broker.py with the methods listed in README
+   Optional: tests for idempotent order intent and partial-fill handling.
+
+—
+11) Risk Controls & Kill Switches
+   • Order throttling: enforce a minimum inter-order interval and burst caps (as per README risk section).
+   • Mandatory in LIVE: DAILY_MAX_LOSS_R stop‑out: on breach, flatten and lock new orders until next session.
+   • Time guards: safe_trading_start, safe_trading_end, hard_trading_end.
+   • Manual kill switch: `.killswitch` file or SIGINT/SIGTERM → flatten/halt.
+Deliverables:
+   Optional: □ risk.py (or equivalent) enforcing DAILY_MAX_LOSS_R
+   □ Integration tests simulate breach → flatten & lock
+
+—
+12) Observability & Audit
+   • Structured logs (JSON or key=value). INFO default; DEBUG with --verbose.
+   • Audit every order (request/response ids, latency, fills).
+   • Dashboard serves runtime metrics; /healthz and /readyz.
+Deliverables:
+   □ Log formatters and sinks
+   □ Dashboard pages wired to live data
+
+—
+13) Packaging & Deployment
+   • Docker Compose: restart: unless-stopped; map 127.0.0.1:8000:8000 for dashboard.
+   • systemd: Restart=always for rl-trader and rl-dashboard.
+   • Document one‑command go‑live from README.
+Deliverables:
+- **[ADD] Packaging & Deployment — One-command go-live**
+  - Optional: provide a `make go-live` target or script. The README’s three commands are authoritative.
+
+- **[ADD] Runbook (LIVE Day‑to‑Day)**
+  □ Optional: If you want a separate ops doc, mirror the README’s Runbook in a `RUNBOOK.md`. Otherwise, ensure the README’s Runbook section remains the source of truth (no extra required file).
+  □ Include explicit IST‑based schedule: 09:00 health checks; 09:15–09:20 warm‑up; exits by `hard_trading_end`.
+  □ Include post‑close flow: fetch data, retrain models, roll forward artifacts.
+  □ Document emergency kill‑switch & rollback procedure; on‑call escalation path.
+    1) `python fetch.py ...`
+    2) `python train.py`
+    3) `python trade.py `
+   □ docker-compose.yml and systemd unit templates
+   □ README section or ops/runbooks aligned to deployment
+
+—
+14) Validation Checklist
+- **Set `BROKER_MODE` in CI** (e.g., `BROKER_MODE=kite_sdk`) before running `python trade.py --dry-run`.
+
+□ CI: install with `pip install --require-hashes -r requirements.txt` and run `python trade.py --dry-run`; fail the build on non-zero exit.
+- **[ADD] Validation Checklist — Global flags help**
+  - Ensure `--verbose` and `--silent` appear in the `--help` output for **each** entry point:
+    - `python fetch.py --help`
+    - `python train.py --help`
+    - `python trade.py --help`
+    - `python dashboard.py --help`
+  - Semantics: “last flag wins”.
+
+15) Licensing
+Deliverables:
+□ Add a `LICENSE` file (choose MIT / Apache‑2.0 / BSD‑3‑Clause) per README.
+□ Link the choice in README; ensure repository clearly shows the license.
+
+### Dashboard – Security Defaults (Applied 2025-11-03 15:36:20)
+- **Bind**: Dashboard must bind to `127.0.0.1` only.
+- **Compose**: Use `ports: ["127.0.0.1:8000:8000"]`.
+- **Auth**: Require `DASHBOARD_AUTH_TOKEN`; reject requests without `Authorization: Bearer <token>`.
+
+
+
+### Config – Required Keys (Applied 2025-11-03 15:36:20)
+Add the following **mandatory** keys to the configuration schema/template:
+- `winner_min_avg_reward` (float)
+- `max_slippage_bps` (integer)
+- `order_min_interval_ms` (integer)
+- `max_orders_per_minute` (integer)
+- `leverage` (number)
+
+**Example snippet**:
+```json
+ {
+   "winner_min_avg_reward": 0.05,
+   "max_slippage_bps": 10,
+   "order_min_interval_ms": 250,
+   "max_orders_per_minute": 15,
+   "leverage": 1.0
+ }
+```
+
+
+
+### trade.py – Winner Gate (Applied 2025-11-03 15:36:20)
+### trade.py – Trading‑Day Gate (Applied 2025-11-03 15:36:20)
+- Implement the trading-day gate per the README’s holiday calendar. It’s acceptable to short‑circuit the loop and exit gracefully on non‑trading days to avoid unnecessary broker calls.
+- Use NSE holiday API or `config/holidays-<year>.json` as fallback.
+
+
+- In **LIVE** (no `--paper`), **refuse to start** (non‑zero exit) if `models/winner/metrics.json` is missing/invalid
+  or if `avg_reward < config['winner_min_avg_reward']`. Do not auto‑fallback to paper.
+- CI dry‑run must fail if the winner is invalid.
+
+
+
+### Broker & Instruments – Protective Stops (Applied 2025-11-03 15:36:20)
+
+• Normalize all symbols to broker `tradingsymbol` via the instruments master (maintain alias mapping).
+• Index *spot* symbols are **not tradable**; for derivatives, resolve the current contract code with correct lot/tick rules before quotes/orders.
+- Expose broker API: `place_stop_loss(...)` and `modify_order(...)`.
+- On **each entry**, synchronously place a **broker‑side, reduce-only protective stop**; record entry & stop IDs in the ledger.
+- On restart, reconcile open positions and ensure a corresponding protective stop exists; if missing, place immediately.
+- Trailing logic may only **tighten** stops (never loosen beyond prior risk).
+
+
+
+### Ledger Bootstrap (Applied 2025-11-03 15:36:20)
+- Do **not** commit empty parquet ledger files.
+- On startup, **auto-create** `orders.parquet`, `fills.parquet`, and `positions.parquet` with the canonical schema.

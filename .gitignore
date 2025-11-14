@@ -1,0 +1,124 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+pytest-debug.log
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pyre/
+.pytype/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / editor folders
+.vscode/
+.idea/
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.pid
+*.swp
+*.swo
+
+# Model, checkpoint, and artifact files
+*.ckpt
+*.pt
+*.pth
+*.pb
+*.onnx
+*.pkl
+*.joblib
+*.safetensors
+
+# Binary / cache data artifacts
+*.npz
+*.npy
+*.db
+*.sqlite
+*.sqlite3
+
+# Project data and runtime state
+data/
+state/
+checkpoints/
+replay_memory*.jsonl
+logs/
+artifacts/
+output/
+runs/
+wandb/
+tensorboard/
+tmp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

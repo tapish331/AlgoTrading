@@ -1,0 +1,7 @@
+requests>=2.31.0
+python-dotenv>=1.0.1
+kiteconnect>=4.2.0
+pandas>=2.1.0
+torch>=2.2.0
+numpy>=1.24.0
+jsonlines>=4.0.0

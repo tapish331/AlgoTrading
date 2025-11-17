@@ -1,3 +1,7 @@
+# Use CPU-only PyTorch to avoid huge CUDA downloads on small servers.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
 requests>=2.31.0
 python-dotenv>=1.0.1
 kiteconnect>=4.2.0

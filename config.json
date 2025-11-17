@@ -47,7 +47,6 @@
     "TCS",
     "TECHM",
     "TITAN",
-    "TMCV",
     "TMPV",
     "TRENT",
     "ULTRACEMCO",
@@ -78,8 +77,6 @@
   "max_concurrent_trades": 5,
   "capital_per_ticker": 10000,
   "leverage": 5.0,
-  "fees_bps": 1.0,
-  "slippage_bps": 2.0,
   "trading": {
     "mode": "paper",
     "poll_interval_seconds": 1

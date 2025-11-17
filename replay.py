@@ -47,6 +47,8 @@ class Trade:
     entry_time: str
     highest_price: float
     lowest_price: float
+    highest_price_time: Optional[str] = None
+    lowest_price_time: Optional[str] = None
     data_timestamp: Optional[str] = None
 
 
@@ -155,8 +157,7 @@ def extract_window_features(
     if missing_cols:
         raise ValueError(f"Missing columns {missing_cols} in historical data for {timestamp}")
     arr = window[columns].to_numpy(dtype=float)
-    arr_norm = normalize_window(arr)
-    return arr_norm.flatten()
+    return arr
 
 
 def compute_day_positions(df: pd.DataFrame) -> Dict[pd.Timestamp, Tuple[int, int]]:
@@ -314,16 +315,28 @@ def build_feature_vector(
     trade_status_idx: int,
     total_trade_status: int,
 ) -> Optional[np.ndarray]:
-    segments: List[np.ndarray] = []
+    raw_segments: List[np.ndarray] = []
     for timeframe in timeframes:
         df = history[timeframe][ticker]
         window = extract_window_features(df, timestamp, lookback)
         if window is None:
             return None
-        segments.append(window)
-    if not segments:
+        raw_segments.append(window)
+    if not raw_segments:
         return None
-    features = np.concatenate(segments, axis=0)
+    stacked = np.concatenate(raw_segments, axis=0)
+    mins = stacked.min(axis=0, keepdims=True)
+    maxs = stacked.max(axis=0, keepdims=True)
+    denom = np.where((maxs - mins) == 0.0, 1.0, maxs - mins)
+    eps = 1e-6
+    safe_mins = np.where(mins == 0.0, eps, mins)
+    range_pct = ((maxs - mins) / safe_mins) * 100.0
+    normalized_segments: List[np.ndarray] = []
+    for segment in raw_segments:
+        norm = (segment - mins) / denom
+        scaled = norm * range_pct
+        normalized_segments.append(scaled.flatten())
+    features = np.concatenate(normalized_segments, axis=0)
 
     position_lookup = decision_positions.get(ticker, {})
     ts_key = timestamp
@@ -667,8 +680,6 @@ def _generate_replay_memory(
     max_concurrent_trades = int(config.get("max_concurrent_trades"))
     capital_per_ticker = float(config.get("capital_per_ticker"))
     leverage = float(config.get("leverage"))
-    fees_bps = float(config.get("fees_bps", 0.0))
-    slippage_bps = float(config.get("slippage_bps", 0.0))
     cost_exchange = str(config.get("transaction_exchange") or config.get("exchange") or "NSE").upper()
     trade_status_list: List[str] = config.get("trade_status", [])
     if not trade_status_list:
@@ -713,8 +724,7 @@ def _generate_replay_memory(
             "[config:reward] reward_fn=proximity_cubic | "
             f"trailing_stop={trailing_stop:.4f} | "
             f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
-            f"shorting_allowed={'short' in trade_status_list} | "
-            f"fees_bps={fees_bps:.2f}, slippage_bps={slippage_bps:.2f}"
+            f"shorting_allowed={'short' in trade_status_list}"
         )
 
     if decision_interval not in timeframes:
@@ -1254,6 +1264,9 @@ def _generate_replay_memory(
         if verbose and total_processed % 100 == 0:
             print(f"[replay:{mode}] Processed {total_processed} timestamps")
 
+    avg_pct_pnl = (
+        realized_pct_sum / realized_pct_count if (mode == "evaluation" and realized_pct_count) else None
+    )
     if verbose:
         if selected_timestamps:
             first_ts, last_ts = selected_timestamps[0], selected_timestamps[-1]
@@ -1342,9 +1355,6 @@ def _generate_replay_memory(
             trades = entry_long + entry_short
             trades_per_day = trades / max(len(unique_days), 1)
             reward_net = reward_accum
-            avg_pct_pnl = (
-                realized_pct_sum / realized_pct_count if realized_pct_count else None
-            )
             avg_pct_label = (
                 f"{avg_pct_pnl:.4f}% (n={realized_pct_count})"
                 if avg_pct_pnl is not None
@@ -1352,13 +1362,7 @@ def _generate_replay_memory(
             )
             print(
                 f"[diag:eval] reward_net={reward_net:.4f}, trades={trades}, "
-                f"trades_per_day={trades_per_day:.2f} | avg_pct_pnl={avg_pct_label} | "
-                f"costs_applied=fees_bps:{fees_bps:.2f}, slippage_bps:{slippage_bps:.2f}"
-            )
-            avg_holding_min = hold_minutes_total / max(hold_minutes_count, 1)
-            print(
-                f"[diag:eval_costs] fees_bps={fees_bps:.2f}, "
-                f"slippage_bps={slippage_bps:.2f} | avg_holding_min={avg_holding_min:.2f}"
+                f"trades_per_day={trades_per_day:.2f} | avg_pct_pnl={avg_pct_label}"
             )
     save_replay_memory(replay_memory, output_path, verbose=verbose)
 
@@ -1368,6 +1372,7 @@ def _generate_replay_memory(
         "records": len(replay_memory),
         "timestamps": len(selected_timestamps),
         "avg_reward": avg_reward,
+        "avg_pct_pnl": avg_pct_pnl,
         "path": output_path,
     }
 

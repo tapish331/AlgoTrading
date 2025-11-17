@@ -59,6 +59,7 @@ def _promote_checkpoint(
     winner_ckpt: Path,
     dataset_signature: str,
     eval_reward: float,
+    eval_pct_pnl: Optional[float] = None,
     verbose: bool = False,
 ) -> None:
     winner_ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,7 @@ def _promote_checkpoint(
         {
             "dataset_signature": dataset_signature,
             "avg_reward": eval_reward,
+            "avg_pct_pnl": eval_pct_pnl,
             "winner_checkpoint": str(winner_ckpt),
             "source_checkpoint": str(current_ckpt),
             "timestamp": time.time(),
@@ -118,18 +120,23 @@ def main() -> None:
         train_agent(train_args)
 
         eval_summary = populate_evaluation_replay_memory(verbose=args.verbose)
+        current_avg_reward = eval_summary.get("avg_reward", float("nan"))
+        current_avg_pct_pnl = eval_summary.get("avg_pct_pnl")
         dataset_sig = _compute_dataset_signature()
 
         input_dim, hidden_layers = _resolve_hparams(SimpleNamespace(input_dim=None, hidden_layers=None), config)
         current_ckpt = CHECKPOINT_DIR / f"light_rainbow_{input_dim}_{hidden_layers}.pt"
 
         meta = _load_meta()
-        prev_avg = meta.get("avg_reward") if meta else None
+        winner_avg_reward = meta.get("avg_reward") if meta else None
+        winner_avg_pct_pnl = meta.get("avg_pct_pnl") if meta else None
         changed = bool(meta and dataset_sig and dataset_sig != meta.get("dataset_signature"))
         print(
             "[train] Promotion check | "
-            f"eval_avg={eval_summary.get('avg_reward', float('nan')):.4f} | "
-            f"prev_avg={(prev_avg if prev_avg is not None else float('nan')):.4f} | "
+            f"current_avg_reward={current_avg_reward:.4f} | "
+            f"winner_avg_reward={(winner_avg_reward if winner_avg_reward is not None else float('nan')):.4f} | "
+            f"current_avg_pct_pnl={(current_avg_pct_pnl if current_avg_pct_pnl is not None else float('nan')):.4f}% | "
+            f"winner_avg_pct_pnl={(winner_avg_pct_pnl if winner_avg_pct_pnl is not None else float('nan')):.4f}% | "
             f"dataset_changed={changed} | ckpt={current_ckpt.name}"
         )
 
@@ -142,6 +149,7 @@ def main() -> None:
                     winner_ckpt=winner_path,
                     dataset_signature=dataset_sig,
                     eval_reward=eval_summary["avg_reward"],
+                    eval_pct_pnl=eval_summary.get("avg_pct_pnl"),
                     verbose=args.verbose,
                 )
             elif args.verbose:

@@ -61,6 +61,19 @@ def _ist_iso_from_any(value: Optional[Any]) -> Optional[str]:
     return ts.isoformat()
 
 
+def _update_trade_extremes(trade: Trade, price: float, timestamp: datetime) -> None:
+    ts = timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=INDIA_TZ)
+    ts_iso = ts.astimezone(INDIA_TZ).isoformat()
+    if price > trade.highest_price or trade.highest_price_time is None:
+        trade.highest_price = price
+        trade.highest_price_time = ts_iso
+    if price < trade.lowest_price or trade.lowest_price_time is None:
+        trade.lowest_price = price
+        trade.lowest_price_time = ts_iso
+
+
 def _parse_time(label: str, raw: Optional[str]) -> dtime:
     if not raw:
         raise ValueError(f"Missing required time configuration for '{label}'.")
@@ -139,6 +152,8 @@ def _persist_active_trades_state(
     active_trades: Dict[str, Trade],
     *,
     verbose: bool,
+    current_prices: Optional[Dict[str, float]] = None,
+    current_pnls: Optional[Dict[str, float]] = None,
 ) -> None:
     payload = {
         "updated_at": datetime.now(tz=INDIA_TZ).isoformat(),
@@ -151,6 +166,10 @@ def _persist_active_trades_state(
                 "entry_time": trade.entry_time,
                 "highest_price": trade.highest_price,
                 "lowest_price": trade.lowest_price,
+                "highest_price_at": trade.highest_price_time,
+                "lowest_price_at": trade.lowest_price_time,
+                "current_price": (current_prices or {}).get(ticker),
+                "current_percent_pnl": (current_pnls or {}).get(ticker),
                 "data_timestamp": trade.data_timestamp,
             }
             for ticker, trade in active_trades.items()
@@ -273,6 +292,8 @@ def _load_active_trades_state(
                 entry_time=str(raw["entry_time"]),
                 highest_price=float(raw.get("highest_price", raw["entry_price"])),
                 lowest_price=float(raw.get("lowest_price", raw["entry_price"])),
+                highest_price_time=raw.get("highest_price_at"),
+                lowest_price_time=raw.get("lowest_price_at"),
                 data_timestamp=str(data_ts) if data_ts not in (None, "") else None,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -383,6 +404,8 @@ def _sync_trades_with_broker(
                 entry_time=entry_time,
                 highest_price=highest_price,
                 lowest_price=lowest_price,
+                highest_price_time=now_iso,
+                lowest_price_time=now_iso,
                 data_timestamp=now_iso,
             )
             mutated = True
@@ -408,6 +431,14 @@ def _sync_trades_with_broker(
             changed = True
         if not getattr(trade, "data_timestamp", None):
             trade.data_timestamp = now_iso
+        if highest_price > trade.highest_price:
+            trade.highest_price = highest_price
+            trade.highest_price_time = now_iso
+            changed = True
+        if lowest_price < trade.lowest_price:
+            trade.lowest_price = lowest_price
+            trade.lowest_price_time = now_iso
+            changed = True
         trade.highest_price = highest_price
         trade.lowest_price = lowest_price
         mutated = mutated or changed
@@ -492,7 +523,24 @@ def _close_all_positions(
             verbose=verbose,
         )
         del active_trades[ticker]
-    _persist_active_trades_state(state_path, active_trades, verbose=verbose)
+    current_pnls = {
+        t: compute_net_percent_pnl(
+            trade.direction == status_long_label,
+            trade.entry_price,
+            prices.get(t),
+            trade.quantity,
+            exchange,
+        )
+        for t, trade in active_trades.items()
+        if prices.get(t) is not None
+    }
+    _persist_active_trades_state(
+        state_path,
+        active_trades,
+        verbose=verbose,
+        current_prices=prices,
+        current_pnls=current_pnls,
+    )
 
 
 def _load_model(config: Dict[str, Any], verbose: bool) -> LightRainbowDQN:
@@ -805,15 +853,15 @@ def run(args: argparse.Namespace) -> None:
                 )
                 _sleep(poll_seconds, args.verbose, "safe_end_wait")
                 continue
-    
+
             # Exit logic for active positions (steps 4.e and 4.f)
             for ticker, trade in list(active_trades.items()):
                 price = prices.get(ticker)
                 if price is None:
                     continue
+                _update_trade_extremes(trade, price, now_ist)
                 action_idx = int(inference.get(ticker, {}).get("action_idx", hold_idx))
                 if trade.direction == status_long_label:
-                    trade.highest_price = max(trade.highest_price, price)
                     stop_price = trade.highest_price * (1 - trailing_stop)
                     should_exit = action_idx == sell_idx or price <= stop_price
                     if should_exit:
@@ -856,7 +904,6 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                         )
                 elif trade.direction == status_short_label:
-                    trade.lowest_price = min(trade.lowest_price, price)
                     stop_price = trade.lowest_price * (1 + trailing_stop)
                     should_exit = action_idx == buy_idx or price >= stop_price
                     if should_exit:
@@ -898,7 +945,7 @@ def run(args: argparse.Namespace) -> None:
                             active_trades,
                             verbose=args.verbose,
                         )
-    
+
             if len(active_trades) >= max_concurrent:
                 _print_active_trades_summary(
                     active_trades,
@@ -906,9 +953,26 @@ def run(args: argparse.Namespace) -> None:
                     exchange,
                     status_long_label,
                 )
+                _persist_active_trades_state(
+                    ACTIVE_TRADES_PATH,
+                    active_trades,
+                    verbose=args.verbose,
+                    current_prices=prices,
+                    current_pnls={
+                        t: compute_net_percent_pnl(
+                            trade.direction == status_long_label,
+                            trade.entry_price,
+                            prices.get(t),
+                            trade.quantity,
+                            exchange,
+                        )
+                        for t, trade in active_trades.items()
+                        if prices.get(t) is not None
+                    },
+                )
                 _sleep(poll_seconds, args.verbose, "max_concurrent_reached")
                 continue
-    
+
             # Entry logic (steps 4.g and 4.h)
             for ticker, result in inference.items():
                 if ticker in active_trades:
@@ -946,6 +1010,8 @@ def run(args: argparse.Namespace) -> None:
                         entry_time=datetime.now(INDIA_TZ).isoformat(),
                         highest_price=price,
                         lowest_price=price,
+                        highest_price_time=now_ist.isoformat(),
+                        lowest_price_time=now_ist.isoformat(),
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
                     trade_status_indices[ticker] = long_status_idx
@@ -980,6 +1046,8 @@ def run(args: argparse.Namespace) -> None:
                         entry_time=datetime.now(INDIA_TZ).isoformat(),
                         highest_price=price,
                         lowest_price=price,
+                        highest_price_time=now_ist.isoformat(),
+                        lowest_price_time=now_ist.isoformat(),
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
                     trade_status_indices[ticker] = short_status_idx
@@ -999,6 +1067,28 @@ def run(args: argparse.Namespace) -> None:
                 prices,
                 exchange,
                 status_long_label,
+            )
+            current_prices = {
+                t: p for t, p in prices.items() if t in active_trades and p is not None
+            }
+            current_pnls: Dict[str, float] = {}
+            for t, trade in active_trades.items():
+                price = prices.get(t)
+                if price is None:
+                    continue
+                current_pnls[t] = compute_net_percent_pnl(
+                    trade.direction == status_long_label,
+                    trade.entry_price,
+                    price,
+                    trade.quantity,
+                    exchange,
+                )
+            _persist_active_trades_state(
+                ACTIVE_TRADES_PATH,
+                active_trades,
+                verbose=args.verbose,
+                current_prices=current_prices,
+                current_pnls=current_pnls,
             )
             _sleep(poll_seconds, args.verbose, "cycle_complete")
     

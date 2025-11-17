@@ -5,7 +5,7 @@
 ## Key Capabilities
 
 - **End-to-end workflow**: refresh NSE constituents, pull multi-timeframe OHLCV from Zerodha, build replay buffers, train the LightRainbowDQN agent, then paper or live trade in a single repository.
-- **Cost-aware RL**: rewards use net percent PnL after brokerage, STT, GST, slippage, and configurable bps fees so the policy optimizes deployable returns.
+- **Cost-aware RL**: rewards use net percent PnL after brokerage, STT, and GST so the policy optimizes deployable returns.
 - **Stateful live loop**: `trade.py` resumes from `state/active_trades.json`, reconciles with broker positions, enforces safe/hard trading windows, and trails stops per ticker.
 - **Config-driven**: `config.json` governs timeframes, tickers, lookback, trade status labels, concurrency limits, and ML hyper-parameters—no code edits required for most tweaks.
 - **Safety-first defaults**: trading starts in paper mode, square-off happens automatically at `safe_end_time`/`hard_end_time`, and only the highest-confidence actionable signal per cycle is executed.
@@ -101,7 +101,6 @@ Feature vectors are assembled per ticker from normalized OHLCV windows across ev
 | Fetch | `fetch.num_candles` | Controls the number of most recent candles stored per timeframe/ticker. |
 | Training | `training_days_num`, `evaluation_days_num`, `train.lookback`, `ml_rl.hidden_layers_num`, `ml_rl.learning_rate`, `ml_rl.batch_size`, `ml_rl.epochs` | Replay generation and model hyper-parameters. |
 | Trading block | `trading.mode`, `trading.poll_interval_seconds` | `mode` defaults to `paper`. Switch to `live` only after verifying the entire stack. |
-| Fees/slippage | `fees_bps`, `slippage_bps` | Applied inside `replay.py` when computing rewards. |
 | Trade status | `trade_status` array | Drives action masking and the state feature appended to every observation (`flat`, `long`, `short`). |
 
 ## Pipelines & CLI Workflows
@@ -130,7 +129,7 @@ python replay.py --populate_training_replay_memory --verbose
 python replay.py --populate_evaluation_replay_memory --verbose
 ```
 
-`replay.py` stitches together synchronized multi-timeframe windows, computes proximity-based contextual rewards, applies brokerage/slippage, and writes JSONL buffers. Diagnostics report action mixes, reward fingerprints, and coverage.
+`replay.py` stitches together synchronized multi-timeframe windows, computes proximity-based contextual rewards, applies brokerage/transaction costs, and writes JSONL buffers. Diagnostics report action mixes, reward fingerprints, and coverage.
 
 ### 4. Train / inspect the LightRainbowDQN
 

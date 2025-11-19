@@ -73,7 +73,7 @@
   "safe_start_time": "09:20",
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
-  "trailing_stop_loss_pct": 0.02,
+  "trailing_stop_loss_pct": 0.005,
   "max_concurrent_trades": 5,
   "capital_per_ticker": 10000,
   "leverage": 5.0,

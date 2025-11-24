@@ -8,6 +8,16 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, cast
 
+import time
+try:
+    import resource  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    resource = None  # type: ignore[assignment]
+try:
+    import psutil  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore[assignment]
+
 try:
     import torch
     import torch.nn as nn
@@ -58,6 +68,33 @@ def _load_config() -> Dict[str, Any]:
         raise FileNotFoundError(f"Missing configuration file at {CONFIG_PATH}")
     with CONFIG_PATH.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _usage_snapshot() -> Optional[Dict[str, float]]:
+    if resource is not None:
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF)  # type: ignore[attr-defined]
+            return {
+                "user": float(usage.ru_utime),
+                "sys": float(usage.ru_stime),
+                "rss_mb": getattr(usage, "ru_maxrss", 0) / 1024.0,
+            }
+        except Exception:
+            pass
+    if psutil is not None:
+        try:
+            proc = psutil.Process()
+            times = proc.cpu_times()
+            mem = proc.memory_info()
+            rss_bytes = getattr(mem, "peak_wset", getattr(mem, "rss", 0))
+            return {
+                "user": float(getattr(times, "user", 0.0)),
+                "sys": float(getattr(times, "system", 0.0)),
+                "rss_mb": float(rss_bytes) / (1024.0 * 1024.0),
+            }
+        except Exception:
+            pass
+    return None
 
 
 if _TORCH_IMPORT_ERROR is None:
@@ -502,6 +539,10 @@ def train_agent(args: argparse.Namespace) -> None:
             f"Original error: {_TORCH_IMPORT_ERROR}"
         )
 
+    # measure wall-clock and CPU/memory usage for the full training run
+    start_wall = time.perf_counter()
+    usage_start = _usage_snapshot()
+
     config = _load_config()
     input_dim, hidden_layers = _resolve_hparams(args, config)
     config_actions: List[str] = config.get("actions", MODEL_ACTIONS)
@@ -796,6 +837,20 @@ def train_agent(args: argparse.Namespace) -> None:
     torch.save(model.state_dict(), checkpoint_path)
     if args.verbose:
         print(f"[ml_rl] Saved updated checkpoint to {checkpoint_path}")
+        end_wall = time.perf_counter()
+        usage_end = _usage_snapshot()
+
+        wall = end_wall - start_wall
+        if usage_start is not None and usage_end is not None:
+            user_cpu = usage_end["user"] - usage_start["user"]
+            sys_cpu = usage_end["sys"] - usage_start["sys"]
+            max_rss_mb = usage_end["rss_mb"]
+            print(
+                "[perf:train_agent] wall=%.3fs | cpu_user=%.3fs | cpu_sys=%.3fs | max_rss=%.1f MB"
+                % (wall, user_cpu, sys_cpu, max_rss_mb)
+            )
+        else:
+            print(f"[perf:train_agent] wall={wall:.3f}s (CPU/mem stats unavailable)")
 
 
 def main(argv: list[str] | None = None) -> int:

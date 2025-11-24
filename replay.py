@@ -15,6 +15,16 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
+import time as _time
+try:
+    import resource  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    resource = None  # type: ignore[assignment]
+try:
+    import psutil  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore[assignment]
+
 from ml_rl import LightRainbowDQN, Tensor, _TORCH_IMPORT_ERROR  # type: ignore[attr-defined]
 from ml_rl import torch  # type: ignore[attr-defined]
 
@@ -70,6 +80,33 @@ def ensure_torch_available() -> None:
             "`pip install -r requirements.txt`. "
             f"Original error: {_TORCH_IMPORT_ERROR}"
         )
+
+
+def _usage_snapshot() -> Optional[Dict[str, float]]:
+    if resource is not None:
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF)  # type: ignore[attr-defined]
+            return {
+                "user": float(usage.ru_utime),
+                "sys": float(usage.ru_stime),
+                "rss_mb": getattr(usage, "ru_maxrss", 0) / 1024.0,
+            }
+        except Exception:
+            pass
+    if psutil is not None:
+        try:
+            proc = psutil.Process()
+            times = proc.cpu_times()
+            mem = proc.memory_info()
+            rss_bytes = getattr(mem, "peak_wset", getattr(mem, "rss", 0))
+            return {
+                "user": float(getattr(times, "user", 0.0)),
+                "sys": float(getattr(times, "system", 0.0)),
+                "rss_mb": float(rss_bytes) / (1024.0 * 1024.0),
+            }
+        except Exception:
+            pass
+    return None
 
 
 def build_model(
@@ -1497,24 +1534,64 @@ def _generate_replay_memory(
 def populate_training_replay_memory(verbose: bool = False) -> Dict[str, Any]:
     if verbose:
         print("[replay:training] Starting training replay generation")
+
+    # measure wall-clock and CPU/memory usage for training replay generation
+    start_wall = _time.perf_counter()
+    usage_start = _usage_snapshot()
+
     summary = _generate_replay_memory("training", TRAINING_REPLAY_PATH, verbose=verbose)
+
+    end_wall = _time.perf_counter()
+    usage_end = _usage_snapshot()
+
     if verbose:
         print(
             f"[replay:training] Saved {summary['records']} records "
             f"from {summary['timestamps']} timestamps"
         )
+        wall = end_wall - start_wall
+        if usage_start is not None and usage_end is not None:
+            user_cpu = usage_end["user"] - usage_start["user"]
+            sys_cpu = usage_end["sys"] - usage_start["sys"]
+            max_rss_mb = usage_end["rss_mb"]
+            print(
+                "[perf:replay_training] wall=%.3fs | cpu_user=%.3fs | cpu_sys=%.3fs | max_rss=%.1f MB"
+                % (wall, user_cpu, sys_cpu, max_rss_mb)
+            )
+        else:
+            print(f"[perf:replay_training] wall={wall:.3f}s (CPU/mem stats unavailable)")
     return summary
 
 
 def populate_evaluation_replay_memory(verbose: bool = False) -> Dict[str, Any]:
     if verbose:
         print("[replay:evaluation] Starting evaluation replay generation")
+
+    # measure wall-clock and CPU/memory usage for evaluation replay generation
+    start_wall = _time.perf_counter()
+    usage_start = _usage_snapshot()
+
     summary = _generate_replay_memory("evaluation", EVALUATION_REPLAY_PATH, verbose=verbose)
+
+    end_wall = _time.perf_counter()
+    usage_end = _usage_snapshot()
+
     if verbose:
         print(
             f"[replay:evaluation] Saved {summary['records']} records "
             f"from {summary['timestamps']} timestamps | avg reward {summary['avg_reward']:.4f}"
         )
+        wall = end_wall - start_wall
+        if usage_start is not None and usage_end is not None:
+            user_cpu = usage_end["user"] - usage_start["user"]
+            sys_cpu = usage_end["sys"] - usage_start["sys"]
+            max_rss_mb = usage_end["rss_mb"]
+            print(
+                "[perf:replay_evaluation] wall=%.3fs | cpu_user=%.3fs | cpu_sys=%.3fs | max_rss=%.1f MB"
+                % (wall, user_cpu, sys_cpu, max_rss_mb)
+            )
+        else:
+            print(f"[perf:replay_evaluation] wall={wall:.3f}s (CPU/mem stats unavailable)")
     return summary
 
 

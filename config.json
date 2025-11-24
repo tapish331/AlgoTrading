@@ -96,6 +96,7 @@
     "epochs": 100
   },
   "train": {
-    "lookback": 5
+    "lookback": 5,
+    "mode": "SL"
   }
 }

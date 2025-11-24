@@ -108,6 +108,8 @@ def main() -> None:
 
     while True:
         config = _load_config()
+        train_mode = str(config.get("train", {}).get("mode", "RL")).upper()
+        print(f"[train] Using train.mode={train_mode}")
         winner_path = WINNER_CHECKPOINT
 
         training_summary = populate_training_replay_memory(verbose=args.verbose)

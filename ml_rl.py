@@ -352,21 +352,26 @@ def _resolve_hparams(args: argparse.Namespace, config: Dict[str, Any]) -> Tuple[
 
 
 class ReplayDataset(Dataset):
-    def __init__(self, samples: List[Tuple[List[float], int, float, float]]):
+    def __init__(self, samples: List[Tuple[List[float], int, float, float, List[float]]]):
         self.features = torch.tensor([s[0] for s in samples], dtype=torch.float32)
         self.actions = torch.tensor([s[1] for s in samples], dtype=torch.long)
         self.rewards = torch.tensor([s[2] for s in samples], dtype=torch.float32)
         self.percent_pnls = torch.tensor([s[3] for s in samples], dtype=torch.float32)
+        self.reward_vectors = torch.tensor(
+            [s[4] for s in samples],
+            dtype=torch.float32,
+        )
 
     def __len__(self) -> int:
         return self.features.shape[0]
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         return (
             self.features[idx],
             self.actions[idx],
             self.rewards[idx],
             self.percent_pnls[idx],
+            self.reward_vectors[idx],
         )
 
 
@@ -374,11 +379,11 @@ def _load_training_samples(
     replay_path: Path,
     input_dim: int,
     verbose: bool = False,
-) -> List[Tuple[List[float], int, float, float]]:
+) -> List[Tuple[List[float], int, float, float, List[float]]]:
     if not replay_path.exists():
         raise FileNotFoundError(f"Replay memory file not found at {replay_path}")
 
-    samples: List[Tuple[List[float], int, float, float]] = []
+    samples: List[Tuple[List[float], int, float, float, List[float]]] = []
     dropped_missing = 0
     dropped_dim_mismatch = 0
     dropped_other = 0
@@ -388,6 +393,24 @@ def _load_training_samples(
             if not line:
                 continue
             record = json.loads(line)
+            if "reward_vector" in record and "features" in record:
+                feats = record.get("features")
+                reward_vec = record.get("reward_vector")
+                best_idx = record.get("best_action_idx")
+                if feats is None or reward_vec is None or best_idx is None:
+                    dropped_missing += 1
+                    continue
+                if len(feats) != input_dim:
+                    dropped_dim_mismatch += 1
+                    continue
+                if not isinstance(reward_vec, list) or len(reward_vec) != len(MODEL_ACTIONS):
+                    dropped_other += 1
+                    continue
+                best_idx = int(best_idx)
+                reward_scalar = float(reward_vec[best_idx]) if 0 <= best_idx < len(reward_vec) else 0.0
+                samples.append((feats, best_idx, reward_scalar, reward_scalar, reward_vec))
+                continue
+
             executed_map = {
                 e.get("ticker"): e.get("action")
                 for e in record.get("executed_events", [])
@@ -418,9 +441,13 @@ def _load_training_samples(
                 ):
                     dropped_other += 1
                     continue
+                action_idx = int(action_idx)
                 reward = float(pnl_map.get(ticker, 0.0))
                 percent_pnl = float(percent_pnl_map.get(ticker, 0.0))
-                samples.append((feats, int(action_idx), reward, percent_pnl))
+                reward_vec = [0.0] * len(MODEL_ACTIONS)
+                if 0 <= action_idx < len(reward_vec):
+                    reward_vec[action_idx] = reward
+                samples.append((feats, action_idx, reward, percent_pnl, reward_vec))
     if verbose:
         print(f"[ml_rl] Loaded {len(samples)} training samples from {replay_path}")
         print(
@@ -478,6 +505,11 @@ def train_agent(args: argparse.Namespace) -> None:
     config = _load_config()
     input_dim, hidden_layers = _resolve_hparams(args, config)
     config_actions: List[str] = config.get("actions", MODEL_ACTIONS)
+    train_cfg = config.get("train", {})
+    train_mode = str(train_cfg.get("mode", "RL")).upper()
+    if train_mode not in ("RL", "SL"):
+        raise ValueError("train.mode must be either 'RL' or 'SL'")
+    use_supervised = train_mode == "SL"
 
     ml_cfg = config.get("ml_rl", {})
     learning_rate = float(ml_cfg.get("learning_rate", 1e-4))
@@ -539,7 +571,7 @@ def train_agent(args: argparse.Namespace) -> None:
             first_batch = None
         sample_counts = [0] * len(MODEL_ACTIONS)
         if first_batch is not None:
-            _, a_samp, _, _ = first_batch
+            _, a_samp, _, _, _ = first_batch
             sample_counts = torch.bincount(a_samp, minlength=len(MODEL_ACTIONS)).cpu().tolist()
         sample_counts_ordered = counts_in_config_order(sample_counts, config_actions)
         sample_pct = pct_from_counts(sample_counts_ordered)
@@ -633,10 +665,11 @@ def train_agent(args: argparse.Namespace) -> None:
         pct_pnl_count = 0
         epoch_qgap_chunks: List[Tensor] = []
         epoch_sample_counts = torch.zeros(len(MODEL_ACTIONS), dtype=torch.long)
-        for feats, actions, rewards, percent_pnls in loader:
+        for feats, actions, rewards, percent_pnls, reward_vectors in loader:
             feats = feats.to(device)
             actions = actions.to(device)
             rewards = rewards.to(device)
+            reward_vectors = reward_vectors.to(device)
             epoch_sample_counts += torch.bincount(actions.detach().cpu(), minlength=len(MODEL_ACTIONS))
 
             optimizer.zero_grad()
@@ -647,8 +680,11 @@ def train_agent(args: argparse.Namespace) -> None:
                     if q_values.shape[1] >= 2:
                         top2, _ = torch.topk(q_values, k=2, dim=1)
                         epoch_qgap_chunks.append((top2[:, 0] - top2[:, 1]).detach().cpu())
-            chosen_q = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
-            loss = loss_fn(chosen_q, rewards)
+            if use_supervised:
+                loss = loss_fn(q_values, reward_vectors)
+            else:
+                chosen_q = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+                loss = loss_fn(chosen_q, rewards)
             loss.backward()
             optimizer.step()
 
@@ -668,8 +704,12 @@ def train_agent(args: argparse.Namespace) -> None:
                 logged_first_batch = True
 
             epoch_loss += loss.item() * feats.size(0)
-            reward_accum += rewards.sum().item()
-            reward_count += rewards.size(0)
+            if use_supervised:
+                reward_accum += reward_vectors.sum().item()
+                reward_count += reward_vectors.numel()
+            else:
+                reward_accum += rewards.sum().item()
+                reward_count += rewards.size(0)
             pct_pnl_accum += float(percent_pnls.sum().item())
             pct_pnl_count += percent_pnls.size(0)
 

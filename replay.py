@@ -644,6 +644,10 @@ def _generate_replay_memory(
     fetch_cfg = config.get("fetch", {})
     train_cfg = config.get("train", {})
     ml_cfg = config.get("ml_rl", {})
+    train_mode = str(train_cfg.get("mode", "RL")).upper()
+    if train_mode not in ("RL", "SL"):
+        raise ValueError("train.mode must be either 'RL' or 'SL'")
+    use_supervised = mode == "training" and train_mode == "SL"
 
     if not tickers:
         raise ValueError("No tickers configured in config.json")
@@ -701,30 +705,37 @@ def _generate_replay_memory(
             f"[replay:{mode}] Model configuration -> "
             f"input_dim={input_dim}, hidden_layers={hidden_layers}, lookback={lookback}"
         )
-    model = build_model(input_dim, hidden_layers, checkpoint_dir, verbose=verbose)
-    if verbose:
-        ckpt_name = f"light_rainbow_{input_dim}_{hidden_layers}.pt"
-        print(
-            "[config] ACTIONS={'hold':%d,'buy':%d,'sell':%d} | "
-            "decision_interval=%s | lookback=%d | timeframes=%d | "
-            "input_dim=%d | hidden_layers=%d | ckpt=%s"
-            % (
-                MODEL_ACTIONS.index("hold"),
-                MODEL_ACTIONS.index("buy"),
-                MODEL_ACTIONS.index("sell"),
-                decision_interval,
-                lookback,
-                len(timeframes),
-                input_dim,
-                hidden_layers,
-                ckpt_name,
+    model = None
+    if not use_supervised:
+        model = build_model(input_dim, hidden_layers, checkpoint_dir, verbose=verbose)
+        if verbose:
+            ckpt_name = f"light_rainbow_{input_dim}_{hidden_layers}.pt"
+            print(
+                "[config] ACTIONS={'hold':%d,'buy':%d,'sell':%d} | "
+                "decision_interval=%s | lookback=%d | timeframes=%d | "
+                "input_dim=%d | hidden_layers=%d | ckpt=%s"
+                % (
+                    MODEL_ACTIONS.index("hold"),
+                    MODEL_ACTIONS.index("buy"),
+                    MODEL_ACTIONS.index("sell"),
+                    decision_interval,
+                    lookback,
+                    len(timeframes),
+                    input_dim,
+                    hidden_layers,
+                    ckpt_name,
+                )
             )
-        )
+            print(
+                "[config:reward] reward_fn=proximity_cubic | "
+                f"trailing_stop={trailing_stop:.4f} | "
+                f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
+                f"shorting_allowed={'short' in trade_status_list}"
+            )
+    elif verbose:
         print(
-            "[config:reward] reward_fn=proximity_cubic | "
-            f"trailing_stop={trailing_stop:.4f} | "
-            f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
-            f"shorting_allowed={'short' in trade_status_list}"
+            f"[replay:{mode}] Supervised mode enabled (SL); "
+            "skipping model load for training replay generation."
         )
 
     if decision_interval not in timeframes:
@@ -846,6 +857,10 @@ def _generate_replay_memory(
     hold_minutes_count = 0
     realized_pct_sum = 0.0
     realized_pct_count = 0
+    # sign distribution of realized trade PnL (evaluation only)
+    realized_pct_pos_count = 0
+    realized_pct_neg_count = 0
+    realized_pct_zero_count = 0
 
     def _record_holding(trade: Trade, exit_timestamp: pd.Timestamp) -> None:
         nonlocal hold_minutes_total, hold_minutes_count
@@ -859,11 +874,19 @@ def _generate_replay_memory(
             pass
 
     def _record_realized_pct(pct_value: float) -> None:
-        nonlocal realized_pct_sum, realized_pct_count
+        nonlocal realized_pct_sum, realized_pct_count, realized_pct_pos_count, realized_pct_neg_count, realized_pct_zero_count
         if mode != "evaluation":
             return
+
         realized_pct_sum += pct_value
         realized_pct_count += 1
+
+        if pct_value > 0:
+            realized_pct_pos_count += 1
+        elif pct_value < 0:
+            realized_pct_neg_count += 1
+        else:
+            realized_pct_zero_count += 1
 
     def _log_reward_trace(
         ticker: str,
@@ -895,6 +918,75 @@ def _generate_replay_memory(
     for ts in selected_timestamps:
         local_time = get_time_component(ts)
         if local_time < safe_start_time:
+            continue
+        if use_supervised and mode == "training":
+            for ticker in tickers:
+                P_val = float(P_lookup.get(ticker, {}).get(ts, 0.0))
+                range_factor = float(range_factor_lookup.get(ticker, {}).get(ts, 0.0))
+                if range_factor == 0.0 and P_val == 0.0:
+                    continue
+                for status_idx, status_label in enumerate(trade_status_list):
+                    feats = build_feature_vector(
+                        ticker,
+                        ts,
+                        history,
+                        timeframes,
+                        lookback,
+                        decision_positions,
+                        status_idx,
+                        total_trade_status,
+                    )
+                    if feats is None or len(feats) != input_dim:
+                        continue
+                    rewards_by_action: List[float] = []
+                    for action_name in MODEL_ACTIONS:
+                        base = _reward_from_P(
+                            P_val,
+                            action_name,
+                            status_idx,
+                            flat_status_idx,
+                            long_status_idx,
+                            short_status_idx,
+                        )
+                        rewards_by_action.append(base * range_factor)
+                    if status_label.lower() == status_long_label.lower():
+                        rewards_by_action[buy_idx] = 0.0
+                    elif status_label.lower() == status_short_label.lower():
+                        rewards_by_action[sell_idx] = 0.0
+                    best_idx = int(max(range(len(MODEL_ACTIONS)), key=lambda i: rewards_by_action[i]))
+                    best_label = model_to_config_label.get(best_idx, MODEL_ACTIONS[best_idx])
+                    replay_memory.append(
+                        {
+                            "timestamp": ts.isoformat(),
+                            "ticker": ticker,
+                            "trade_status_idx": status_idx,
+                            "trade_status": status_label,
+                            "features": feats.tolist(),
+                            "reward_vector": rewards_by_action,
+                            "best_action_idx": best_idx,
+                            "best_action": best_label,
+                            "P": P_val,
+                            "range_factor": range_factor,
+                        }
+                    )
+                    total_processed += 1
+                    reward_accum += rewards_by_action[best_idx]
+                    reward_events += 1
+                    for ai, canonical in enumerate(MODEL_ACTIONS):
+                        val = rewards_by_action[ai]
+                        reward_sum_by_action[canonical] += val
+                        reward_sq_by_action[canonical] += val * val
+                        reward_cnt_by_action[canonical] += 1
+                        if val < 0:
+                            reward_neg_by_action[canonical] += 1
+                    if 0 <= best_idx < len(action_counts):
+                        action_counts[best_idx] += 1
+                    min_reward = min(min_reward, min(rewards_by_action))
+                    max_reward = max(max_reward, max(rewards_by_action))
+                    if rewards_by_action[best_idx] < 0:
+                        negative_rewards += 1
+            if verbose and total_processed and total_processed % 1000 == 0:
+                print(f"[replay:{mode}] Supervised samples generated: {total_processed}")
             continue
 
         status_before = dict(trade_status_indices)
@@ -1271,43 +1363,44 @@ def _generate_replay_memory(
         if selected_timestamps:
             first_ts, last_ts = selected_timestamps[0], selected_timestamps[-1]
             print(f"[replay:{mode}] Date range: {first_ts} -> {last_ts}")
-        total_actions = sum(action_counts)
-        if total_actions:
-            ordered_pairs = []
-            for label in action_labels:
-                idx = canonical_index.get(label.lower())
-                if idx is None or idx >= len(action_counts):
-                    continue
-                ordered_pairs.append((label, action_counts[idx]))
-            label_counts = ", ".join(f"{label}:{count}" for label, count in ordered_pairs)
-            print(f"[replay:{mode}] Actions [{label_counts}] (total={total_actions})")
-        chosen_total = total_actions
-        no_op_rate = 1.0 - (executed_total / max(chosen_total, 1))
-        print(
-            f"[diag:action_exec] chosen={chosen_total} legal={legal_decisions} "
-            f"executed={executed_total} no_op_rate={no_op_rate:.2f}"
-        )
-        def _mix(mix_counts: Dict[str, int]) -> str:
-            tot = sum(mix_counts.values()) or 1
-            return (
-                f"hold={mix_counts['hold']/tot:.2%}, "
-                f"buy={mix_counts['buy']/tot:.2%}, "
-                f"sell={mix_counts['sell']/tot:.2%}"
+        if not use_supervised:
+            total_actions = sum(action_counts)
+            if total_actions:
+                ordered_pairs = []
+                for label in action_labels:
+                    idx = canonical_index.get(label.lower())
+                    if idx is None or idx >= len(action_counts):
+                        continue
+                    ordered_pairs.append((label, action_counts[idx]))
+                label_counts = ", ".join(f"{label}:{count}" for label, count in ordered_pairs)
+                print(f"[replay:{mode}] Actions [{label_counts}] (total={total_actions})")
+            chosen_total = total_actions
+            no_op_rate = 1.0 - (executed_total / max(chosen_total, 1))
+            print(
+                f"[diag:action_exec] chosen={chosen_total} legal={legal_decisions} "
+                f"executed={executed_total} no_op_rate={no_op_rate:.2f}"
             )
-        print(
-            "[diag:state_action] flat("
-            + _mix(state_action_counts["flat"])
-            + ") long("
-            + _mix(state_action_counts["long"])
-            + ") short("
-            + _mix(state_action_counts["short"])
-            + ")"
-        )
-        print(
-            f"[diag:exec_mix] open_long={entry_long} open_short={entry_short} "
-            f"exit_long_signal={exit_long_signal} exit_long_trailing_stop={exit_long_trail} "
-            f"exit_short_signal={exit_short_signal} exit_short_trailing_stop={exit_short_trail}"
-        )
+            def _mix(mix_counts: Dict[str, int]) -> str:
+                tot = sum(mix_counts.values()) or 1
+                return (
+                    f"hold={mix_counts['hold']/tot:.2%}, "
+                    f"buy={mix_counts['buy']/tot:.2%}, "
+                    f"sell={mix_counts['sell']/tot:.2%}"
+                )
+            print(
+                "[diag:state_action] flat("
+                + _mix(state_action_counts["flat"])
+                + ") long("
+                + _mix(state_action_counts["long"])
+                + ") short("
+                + _mix(state_action_counts["short"])
+                + ")"
+            )
+            print(
+                f"[diag:exec_mix] open_long={entry_long} open_short={entry_short} "
+                f"exit_long_signal={exit_long_signal} exit_long_trailing_stop={exit_long_trail} "
+                f"exit_short_signal={exit_short_signal} exit_short_trailing_stop={exit_short_trail}"
+            )
         safe_min = min_reward if min_reward != float("inf") else 0.0
         safe_max = max_reward if max_reward != float("-inf") else 0.0
         avg_reward = reward_accum / max(reward_events, 1)
@@ -1329,41 +1422,61 @@ def _generate_replay_memory(
             display = label_lower_map.get(canonical, canonical)
             return f"{display}(mean={mean:.4f},std={std:.4f},neg%={negp:.1f})"
         print("[diag:replay] rewards_by_action=" + ", ".join(_fmt(label) for label in MODEL_ACTIONS))
-        if qstats_n > 0:
+        if not use_supervised and qstats_n > 0:
             print(
                 "[replay:%s] policy_top2_qgap_mean=%.6f | q_mean=%.6f | n=%d"
                 % (mode, qgap_sum / qstats_n, qmean_sum / qstats_n, qstats_n)
             )
         import hashlib
 
-        fp_rows: List[str] = []
-        for record in replay_memory[:200]:
-            ts = record.get("timestamp", "")
-            pnl_map = record.get("pnl_pct", {})
-            for ticker, data in sorted(record.get("ticker_actions", {}).items()):
-                ai = int(data.get("action_idx", -1))
-                reward = float(pnl_map.get(ticker, 0.0))
-                fp_rows.append(f"{ts}|{ticker}|{ai}|{reward:.6f}")
-        fingerprint = hashlib.sha256("\n".join(fp_rows).encode("utf-8")).hexdigest()
-        print(f"[replay:{mode}] fingerprint={fingerprint}")
-        print(f"[replay:{mode}] Replay transitions generated: {len(replay_memory)}")
-        if mode == "evaluation":
-            unique_days = {
-                ts.tz_convert(INDIA_TZ).date() if ts.tzinfo else ts.date()
-                for ts in selected_timestamps
-            }
-            trades = entry_long + entry_short
-            trades_per_day = trades / max(len(unique_days), 1)
-            reward_net = reward_accum
-            avg_pct_label = (
-                f"{avg_pct_pnl:.4f}% (n={realized_pct_count})"
-                if avg_pct_pnl is not None
-                else "n/a"
-            )
-            print(
-                f"[diag:eval] reward_net={reward_net:.4f}, trades={trades}, "
-                f"trades_per_day={trades_per_day:.2f} | avg_pct_pnl={avg_pct_label}"
-            )
+        if not use_supervised:
+            fp_rows: List[str] = []
+            for record in replay_memory[:200]:
+                ts = record.get("timestamp", "")
+                pnl_map = record.get("pnl_pct", {})
+                for ticker, data in sorted(record.get("ticker_actions", {}).items()):
+                    ai = int(data.get("action_idx", -1))
+                    reward = float(pnl_map.get(ticker, 0.0))
+                    fp_rows.append(f"{ts}|{ticker}|{ai}|{reward:.6f}")
+            fingerprint = hashlib.sha256("\n".join(fp_rows).encode("utf-8")).hexdigest()
+            print(f"[replay:{mode}] fingerprint={fingerprint}")
+            print(f"[replay:{mode}] Replay transitions generated: {len(replay_memory)}")
+            if mode == "evaluation":
+                unique_days = {
+                    ts.tz_convert(INDIA_TZ).date() if ts.tzinfo else ts.date()
+                    for ts in selected_timestamps
+                }
+                trades = entry_long + entry_short
+                trades_per_day = trades / max(len(unique_days), 1)
+                reward_net = reward_accum
+                avg_pct_label = (
+                    f"{avg_pct_pnl:.4f}% (n={realized_pct_count})"
+                    if avg_pct_pnl is not None
+                    else "n/a"
+                )
+                print(
+                    f"[diag:eval] reward_net={reward_net:.4f}, trades={trades}, "
+                    f"trades_per_day={trades_per_day:.2f} | avg_pct_pnl={avg_pct_label} | "
+                    f"trades_pos={realized_pct_pos_count}, trades_neg={realized_pct_neg_count}, "
+                    f"trades_zero={realized_pct_zero_count}"
+                )
+        else:
+            fp_rows = []
+            for record in replay_memory[:200]:
+                ts = record.get("timestamp", "")
+                ticker = record.get("ticker", "")
+                best_idx = int(record.get("best_action_idx", -1))
+                reward_vec = record.get("reward_vector", [])
+                reward_val = 0.0
+                if isinstance(reward_vec, list) and 0 <= best_idx < len(reward_vec):
+                    try:
+                        reward_val = float(reward_vec[best_idx])
+                    except Exception:
+                        reward_val = 0.0
+                fp_rows.append(f"{ts}|{ticker}|{best_idx}|{reward_val:.6f}")
+            fingerprint = hashlib.sha256("\n".join(fp_rows).encode("utf-8")).hexdigest()
+            print(f"[replay:{mode}] fingerprint={fingerprint}")
+            print(f"[replay:{mode}] Supervised samples generated: {len(replay_memory)}")
     save_replay_memory(replay_memory, output_path, verbose=verbose)
 
     avg_reward = reward_accum / max(reward_events, 1)
@@ -1373,6 +1486,10 @@ def _generate_replay_memory(
         "timestamps": len(selected_timestamps),
         "avg_reward": avg_reward,
         "avg_pct_pnl": avg_pct_pnl,
+        "completed_trades": realized_pct_count,
+        "positive_trades": realized_pct_pos_count,
+        "negative_trades": realized_pct_neg_count,
+        "flat_trades": realized_pct_zero_count,
         "path": output_path,
     }
 

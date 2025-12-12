@@ -10,3 +10,4 @@ torch>=2.2.0
 numpy>=1.24.0
 jsonlines>=4.0.0
 psutil>=5.9.0
+# tune_trailing_stop_loss.py relies only on stdlib; no extra packages required.

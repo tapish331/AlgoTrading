@@ -717,7 +717,10 @@ def _generate_replay_memory(
     evaluation_days = int(config.get("evaluation_days_num", 0))
     safe_start_time = datetime.strptime(config.get("safe_start_time"), "%H:%M").time()
     safe_end_time = datetime.strptime(config.get("safe_end_time"), "%H:%M").time()
-    trailing_stop = float(config.get("trailing_stop_loss_pct"))
+    trailing_stop_key = (
+        "training_trailing_stop_loss_pct" if mode == "training" else "evaluation_trailing_stop_loss_pct"
+    )
+    trailing_stop = float(config.get(trailing_stop_key))
     max_concurrent_trades = int(config.get("max_concurrent_trades"))
     capital_per_ticker = float(config.get("capital_per_ticker"))
     leverage = float(config.get("leverage"))

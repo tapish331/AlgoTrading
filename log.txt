@@ -1,0 +1,63 @@
+● google-cloud-ops-agent.service - Google Cloud Ops Agent
+     Loaded: loaded (/lib/systemd/system/google-cloud-ops-agent.service; enabled; preset: enabled)
+     Active: active (exited) since Tue 2025-11-25 13:32:41 UTC; 2 weeks 2 days ago
+    Process: 418 ExecStartPre=/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine -in /etc/google-cloud-ops-agent/config.yaml (code=exited, status=0/SUCCESS)
+    Process: 927 ExecStart=/bin/true (code=exited, status=0/SUCCESS)
+   Main PID: 927 (code=exited, status=0/SUCCESS)
+        CPU: 398ms
+
+Nov 25 13:32:34 algotrading google_cloud_ops_agent_engine[418]:     pipelines:
+Nov 25 13:32:34 algotrading google_cloud_ops_agent_engine[418]:       default_pipeline:
+Nov 25 13:32:34 algotrading google_cloud_ops_agent_engine[418]:         receivers: [hostmetrics]
+Nov 25 13:32:34 algotrading google_cloud_ops_agent_engine[418]:         processors: [metrics_filter]
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[418]: 2025/11/25 13:32:41 [Ports Check] Result: PASS
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[418]: 2025/11/25 13:32:41 [Network Check] Result: PASS
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[418]: 2025/11/25 13:32:41 [API Check] Result: FAIL, Error code: MonApiDisabledErr, Failure: The Monitoring API is disabled in the current Google Cloud project., Solution: Enable Monitoring API in the current Google Cloud project., Resource: https://cloud.google.com/monitoring/api/enable-api
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[418]: 2025/11/25 13:32:41 [API Check] Result: FAIL, Error code: LogApiDisabledErr, Failure: The Logging API is disabled in the current Google Cloud project., Solution: Enable Logging API in the current Google Cloud project., Resource: https://cloud.google.com/logging/docs/api/enable-api
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[418]: 2025/11/25 13:32:41 Startup checks finished
+Nov 25 13:32:41 algotrading systemd[1]: Finished google-cloud-ops-agent.service - Google Cloud Ops Agent.
+
+● google-cloud-ops-agent-fluent-bit.service - Google Cloud Ops Agent - Logging Agent
+     Loaded: loaded (/lib/systemd/system/google-cloud-ops-agent-fluent-bit.service; static)
+     Active: active (running) since Tue 2025-11-25 13:32:41 UTC; 2 weeks 2 days ago
+    Process: 928 ExecStartPre=/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine -service=fluentbit -in /etc/google-cloud-ops-agent/config.yaml -logs ${LOGS_DIRECTORY} -state ${STATE_DIRECTORY} (code=exited, status=0/SUCCESS)
+   Main PID: 974 (google_cloud_op)
+      Tasks: 32 (limit: 4681)
+     Memory: 45.3M
+        CPU: 22h 39min 35.536s
+     CGroup: /system.slice/google-cloud-ops-agent-fluent-bit.service
+             ├─ 974 /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_wrapper -config_path /etc/google-cloud-ops-agent/config.yaml -log_path /var/log/google-cloud-ops-agent/subagents/logging-module.log /opt/google-cloud-ops-agent/subagents/fluent-bit/bin/fluent-bit --config /run/google-cloud-ops-agent-fluent-bit/fluent_bit_main.conf --parser /run/google-cloud-ops-agent-fluent-bit/fluent_bit_parser.conf --storage_path /var/lib/google-cloud-ops-agent/fluent-bit/buffers
+             └─1001 /opt/google-cloud-ops-agent/subagents/fluent-bit/bin/fluent-bit --config /run/google-cloud-ops-agent-fluent-bit/fluent_bit_main.conf --parser /run/google-cloud-ops-agent-fluent-bit/fluent_bit_parser.conf --storage_path /var/lib/google-cloud-ops-agent/fluent-bit/buffers
+
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:   processors:
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:     metrics_filter:
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:       type: exclude_metrics
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:       metrics_pattern: []
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:   service:
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:     pipelines:
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:       default_pipeline:
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:         receivers: [hostmetrics]
+Nov 25 13:32:41 algotrading google_cloud_ops_agent_engine[928]:         processors: [metrics_filter]
+Nov 25 13:32:41 algotrading systemd[1]: Started google-cloud-ops-agent-fluent-bit.service - Google Cloud Ops Agent - Logging Agent.
+
+● google-cloud-ops-agent-opentelemetry-collector.service - Google Cloud Ops Agent - Metrics Agent
+     Loaded: loaded (/lib/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service; static)
+     Active: active (running) since Tue 2025-11-25 13:32:41 UTC; 2 weeks 2 days ago
+    Process: 929 ExecStartPre=/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine -service=otel -in /etc/google-cloud-ops-agent/config.yaml -logs ${LOGS_DIRECTORY} (code=exited, status=0/SUCCESS)
+   Main PID: 975 (otelopscol)
+      Tasks: 10 (limit: 4681)
+     Memory: 80.3M
+        CPU: 1h 30min 25.616s
+     CGroup: /system.slice/google-cloud-ops-agent-opentelemetry-collector.service
+             └─975 /opt/google-cloud-ops-agent/subagents/opentelemetry-collector/otelopscol --config=/run/google-cloud-ops-agent-opentelemetry-collector/otel.yaml --feature-gates=receiver.prometheusreceiver.RemoveStartTimeAdjustment
+
+Dec 11 15:12:44 algotrading otelopscol[975]:         /root/go/pkg/mod/go.opentelemetry.io/collector/exporter/exporterhelper@v0.136.0/internal/queuebatch/disabled_batcher.go:23
+Dec 11 15:12:44 algotrading otelopscol[975]: go.opentelemetry.io/collector/exporter/exporterhelper/internal/queue.(*asyncQueue[...]).Start.func1
+Dec 11 15:12:44 algotrading otelopscol[975]:         /root/go/pkg/mod/go.opentelemetry.io/collector/exporter/exporterhelper@v0.136.0/internal/queue/async_queue.go:49
+Dec 11 15:12:58 algotrading otelopscol[975]: 2025-12-11T15:12:58.094Z        error        internal/queue_sender.go:42        Exporting failed. Dropping data.        {"resource": {"service.instance.id": "dcdda7cf-2c84-40e7-88d7-1185ef72af17", "service.name": "otelopscol", "service.version": "v0.136.0"}, "otelcol.component.id": "googlecloud", "otelcol.component.kind": "exporter", "otelcol.signal": "metrics", "error": "rpc error: code = PermissionDenied desc = Cloud Monitoring API has not been used in project 502019846093 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/monitoring.googleapis.com/overview?project=502019846093 then retry. If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry.\nerror details: name = ErrorInfo reason = SERVICE_DISABLED domain = googleapis.com metadata = map[activationUrl:https://console.developers.google.com/apis/api/monitoring.googleapis.com/overview?project=502019846093 consumer:projects/502019846093 containerInfo:502019846093 service:monitoring.googleapis.com serviceTitle:Cloud Monitoring API]\nerror details: name = Help desc = Google developers console API activation url = https://console.developers.google.com/apis/api/monitoring.googleapis.com/overview?project=502019846093\nerror details: name = LocalizedMessage locale = en-US msg = Cloud Monitoring API has not been used in project 502019846093 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/monitoring.googleapis.com/overview?project=502019846093 then retry. If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry.", "dropped_items": 1}
+Dec 11 15:12:58 algotrading otelopscol[975]: go.opentelemetry.io/collector/exporter/exporterhelper/internal.NewQueueSender.func1
+Dec 11 15:12:58 algotrading otelopscol[975]:         /root/go/pkg/mod/go.opentelemetry.io/collector/exporter/exporterhelper@v0.136.0/internal/queue_sender.go:42
+Dec 11 15:12:58 algotrading otelopscol[975]: go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch.(*disabledBatcher[...]).Consume
+Dec 11 15:12:58 algotrading otelopscol[975]:         /root/go/pkg/mod/go.opentelemetry.io/collector/exporter/exporterhelper@v0.136.0/internal/queuebatch/disabled_batcher.go:23
+Dec 11 15:12:58 algotrading otelopscol[975]: go.opentelemetry.io/collector/exporter/exporterhelper/internal/queue.(*asyncQueue[...]).Start.func1
+Dec 11 15:12:58 algotrading otelopscol[975]:         /root/go/pkg/mod/go.opentelemetry.io/collector/exporter/exporterhelper@v0.136.0/internal/queue/async_queue.go:49

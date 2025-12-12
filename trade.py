@@ -632,7 +632,7 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("decision_interval must be one of the configured timeframes")
 
     lookback = int(config.get("train", {}).get("lookback", 1))
-    trailing_stop = float(config.get("trailing_stop_loss_pct", 0.0))
+    trailing_stop = float(config.get("evaluation_trailing_stop_loss_pct", 0.0))
     max_concurrent = int(config.get("max_concurrent_trades", 1))
     capital_per_ticker = float(config.get("capital_per_ticker", 0.0))
     leverage = float(config.get("leverage", 1.0))

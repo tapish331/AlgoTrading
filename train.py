@@ -72,8 +72,10 @@ def _promote_checkpoint(
     current_ckpt: Path,
     winner_ckpt: Path,
     dataset_signature: str,
-    eval_reward: float,
+    pnl_per_trade: Optional[float],
+    eval_reward: Optional[float],
     eval_pct_pnl: Optional[float] = None,
+    completed_trades: Optional[int] = None,
     verbose: bool = False,
 ) -> None:
     winner_ckpt.parent.mkdir(parents=True, exist_ok=True)
@@ -81,8 +83,10 @@ def _promote_checkpoint(
     _save_meta(
         {
             "dataset_signature": dataset_signature,
-            "avg_reward": eval_reward,
+            "pnl_per_trade": pnl_per_trade,
             "avg_pct_pnl": eval_pct_pnl,
+            "completed_trades": completed_trades,
+            "avg_reward": eval_reward,
             "winner_checkpoint": str(winner_ckpt),
             "source_checkpoint": str(current_ckpt),
             "timestamp": time.time(),
@@ -95,14 +99,20 @@ def _promote_checkpoint(
 def _should_promote(
     meta: Optional[Dict[str, Any]],
     dataset_signature: str,
-    eval_reward: float,
+    eval_pnl_per_trade: Optional[float],
 ) -> bool:
     if meta is None:
         return True
     if dataset_signature and dataset_signature != meta.get("dataset_signature"):
         return True
-    previous_reward = meta.get("avg_reward", float("-inf"))
-    return eval_reward > previous_reward
+    if eval_pnl_per_trade is None:
+        return False
+    previous_pnl = meta.get("pnl_per_trade")
+    if previous_pnl is None:
+        previous_pnl = meta.get("avg_pct_pnl")
+    if previous_pnl is None:
+        previous_pnl = meta.get("avg_reward", float("-inf"))
+    return eval_pnl_per_trade > float(previous_pnl)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -138,6 +148,8 @@ def main() -> None:
         eval_summary = populate_evaluation_replay_memory(verbose=args.verbose)
         current_avg_reward = eval_summary.get("avg_reward", float("nan"))
         current_avg_pct_pnl = eval_summary.get("avg_pct_pnl")
+        current_trades = int(eval_summary.get("completed_trades", 0) or 0)
+        pnl_per_trade = current_avg_pct_pnl
         dataset_sig = _compute_dataset_signature()
 
         input_dim, hidden_layers = _resolve_hparams(SimpleNamespace(input_dim=None, hidden_layers=None), config)
@@ -145,27 +157,34 @@ def main() -> None:
 
         meta = _load_meta()
         winner_avg_reward = meta.get("avg_reward") if meta else None
-        winner_avg_pct_pnl = meta.get("avg_pct_pnl") if meta else None
+        winner_pnl_per_trade = None
+        if meta:
+            winner_pnl_per_trade = meta.get("pnl_per_trade")
+            if winner_pnl_per_trade is None:
+                winner_pnl_per_trade = meta.get("avg_pct_pnl")
         changed = bool(meta and dataset_sig and dataset_sig != meta.get("dataset_signature"))
         print(
             "[train] Promotion check | "
-            f"current_avg_reward={current_avg_reward:.4f} | "
+            f"pnl_per_trade={(pnl_per_trade if pnl_per_trade is not None else float('nan')):.4f}% | "
+            f"winner_pnl_per_trade={(winner_pnl_per_trade if winner_pnl_per_trade is not None else float('nan')):.4f}% | "
+            f"trades={current_trades} | "
+            f"avg_reward={current_avg_reward:.4f} | "
             f"winner_avg_reward={(winner_avg_reward if winner_avg_reward is not None else float('nan')):.4f} | "
-            f"current_avg_pct_pnl={(current_avg_pct_pnl if current_avg_pct_pnl is not None else float('nan')):.4f}% | "
-            f"winner_avg_pct_pnl={(winner_avg_pct_pnl if winner_avg_pct_pnl is not None else float('nan')):.4f}% | "
             f"dataset_changed={changed} | ckpt={current_ckpt.name}"
         )
 
         if not current_ckpt.exists():
             print(f"[train] Warning: checkpoint {current_ckpt} missing; skipping promotion check.")
         else:
-            if _should_promote(meta, dataset_sig, eval_summary["avg_reward"]):
+            if _should_promote(meta, dataset_sig, pnl_per_trade):
                 _promote_checkpoint(
                     current_ckpt=current_ckpt,
                     winner_ckpt=winner_path,
                     dataset_signature=dataset_sig,
-                    eval_reward=eval_summary["avg_reward"],
+                    pnl_per_trade=pnl_per_trade,
+                    eval_reward=eval_summary.get("avg_reward"),
                     eval_pct_pnl=eval_summary.get("avg_pct_pnl"),
+                    completed_trades=current_trades,
                     verbose=args.verbose,
                 )
                 _run_trailing_stop_tuning(verbose=args.verbose)

@@ -86,7 +86,7 @@
       0.03,
       0.05
     ],
-    "trailing_stop_metric": "avg_reward"
+    "trailing_stop_metric": "avg_pct_pnl"
   },
   "max_concurrent_trades": 5,
   "capital_per_ticker": 10000,

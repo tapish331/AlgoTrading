@@ -147,7 +147,7 @@ Training uses a weighted sampler to balance hold/buy/sell classes, logs per-acti
 python train.py --verbose
 ```
 
-`train.py` loops forever: regenerate replay buffers, train the agent, run evaluation replay, compare against the previous `light_rainbow_winner.pt` using dataset signatures + average reward, and promote when the new model improves or the dataset changed. Promotion metadata is stored in `checkpoints/winner_meta.json`.
+`train.py` loops forever: regenerate replay buffers, train the agent, run evaluation replay, compare against the previous `light_rainbow_winner.pt` using dataset signatures + per-trade PnL (total PnL / trades), and promote when the new model improves or the dataset changed. Promotion metadata is stored in `checkpoints/winner_meta.json`.
 
 ### 6. Live / paper trading
 

@@ -12,7 +12,7 @@ from replay import CONFIG_PATH, load_config, populate_evaluation_replay_memory
 
 # Default search space if config does not define one.
 DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
-DEFAULT_METRIC = "avg_reward"
+DEFAULT_METRIC = "avg_pct_pnl"
 
 
 def _write_config(config: Dict[str, Any], path: Path, verbose: bool) -> None:

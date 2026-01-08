@@ -6,7 +6,7 @@
 
 - **End-to-end workflow**: refresh NSE constituents, pull multi-timeframe OHLCV from Zerodha, build replay buffers, train the LightRainbowDQN agent, then paper or live trade in a single repository.
 - **Cost-aware RL**: rewards use net percent PnL after brokerage, STT, and GST so the policy optimizes deployable returns.
-- **Stateful live loop**: `trade.py` resumes from `state/active_trades.json`, reconciles with broker positions, enforces safe/hard trading windows, and trails stops per ticker.
+- **Stateful live loop**: `trade.py` resumes from `state/active_trades.json`, reconciles with broker positions, enforces safe/hard trading windows, and applies trailing stops/take-profit targets per ticker.
 - **Config-driven**: `config.json` governs timeframes, tickers, lookback, trade status labels, concurrency limits, and ML hyper-parameters—no code edits required for most tweaks.
 - **Safety-first defaults**: trading starts in paper mode, square-off happens automatically at `safe_end_time`/`hard_end_time`, and only the highest-confidence actionable signal per cycle is executed.
 
@@ -97,7 +97,7 @@ Feature vectors are assembled per ticker from normalized OHLCV windows across ev
 | --- | --- | --- |
 | Top-level | `index`, `tickers`, `timeframes`, `decision_interval`, `actions` | Refresh tickers via `nse.py`; `decision_interval` must be in `timeframes`. |
 | Session limits | `safe_start_time`, `safe_end_time`, `hard_end_time` | Trading waits until safe start, closes positions at safe end, and force-square-offs at hard end. |
-| Risk & sizing | `trailing_stop_loss_pct`, `max_concurrent_trades`, `capital_per_ticker`, `leverage` | Used directly by `trade.py` for position sizing and trailing stops. |
+| Risk & sizing | `training_trailing_stop_loss_pct`, `evaluation_trailing_stop_loss_pct`, `training_take_profit_pct`, `evaluation_take_profit_pct`, `max_concurrent_trades`, `capital_per_ticker`, `leverage` | Used by `replay.py`/`trade.py` for position sizing and exit rules. |
 | Fetch | `fetch.num_candles` | Controls the number of most recent candles stored per timeframe/ticker. |
 | Training | `training_days_num`, `evaluation_days_num`, `train.lookback`, `ml_rl.hidden_layers_num`, `ml_rl.learning_rate`, `ml_rl.batch_size`, `ml_rl.epochs` | Replay generation and model hyper-parameters. |
 | Trading block | `trading.mode`, `trading.poll_interval_seconds` | `mode` defaults to `paper`. Switch to `live` only after verifying the entire stack. |
@@ -161,7 +161,7 @@ python trade.py --verbose --poll-seconds 5
 2. Restores `state/active_trades.json` and reconciles with live broker positions (in live mode).
 3. Each loop fetches a fresh snapshot via `fetch_market_snapshot`, rebuilds features, and infers actions for every ticker.
 4. Only the highest-confidence actionable ticker per cycle can open a new position, respecting `max_concurrent_trades`.
-5. Trailing stops (`trailing_stop_loss_pct`) and opposite signals close positions. Safe/hard windows force square-offs and completed trades are appended to `state/completed_trades/<date>.jsonl`.
+5. Trailing stops (`evaluation_trailing_stop_loss_pct`), take-profit targets (`evaluation_take_profit_pct`), and opposite signals close positions. Safe/hard windows force square-offs and completed trades are appended to `state/completed_trades/<date>.jsonl`.
 6. The loop defaults to `trading.mode = paper`; set `live` only after dry-running end to end.
 
 Interrupting the script performs an orderly square-off and persists state so the next session resumes safely.
@@ -177,7 +177,7 @@ Interrupting the script performs an orderly square-off and persists state so the
 
 - **Paper-first**: `config["trading"]["mode"]` defaults to `paper`, and `submit_market_order` turns into a dry-run until you explicitly opt into live.
 - **Session guards**: `safe_start_time`, `safe_end_time`, and `hard_end_time` keep entries within your comfort window and guarantee square-off at the hard cutoff (even on KeyboardInterrupt).
-- **Trade accounting**: `trade.py` syncs with broker positions on startup (so orphaned live positions are captured) and logs every exit reason (`signal` vs `trailing_stop`) along with %PnL after costs.
+- **Trade accounting**: `trade.py` syncs with broker positions on startup (so orphaned live positions are captured) and logs every exit reason (`signal`, `trailing_stop`, `take_profit`) along with %PnL after costs.
 - **Diagnostics**: All pipelines emit concise `[diag:*]` lines—action mixes, reward stats, sampler behavior, Q-gap metrics, replay fingerprints—which helps validate new datasets or config tweaks before going live.
 - **Data quality**: Feature generation requires complete history per ticker/timeframe. Missing frames are explained in verbose logs so you can re-run `fetch.py` or adjust `lookback`.
 

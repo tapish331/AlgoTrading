@@ -633,6 +633,7 @@ def run(args: argparse.Namespace) -> None:
 
     lookback = int(config.get("train", {}).get("lookback", 1))
     trailing_stop = float(config.get("evaluation_trailing_stop_loss_pct", 0.0))
+    take_profit = float(config.get("evaluation_take_profit_pct", 0.0))
     max_concurrent = int(config.get("max_concurrent_trades", 1))
     capital_per_ticker = float(config.get("capital_per_ticker", 0.0))
     leverage = float(config.get("leverage", 1.0))
@@ -863,7 +864,11 @@ def run(args: argparse.Namespace) -> None:
                 action_idx = int(inference.get(ticker, {}).get("action_idx", hold_idx))
                 if trade.direction == status_long_label:
                     stop_price = trade.highest_price * (1 - trailing_stop)
-                    should_exit = action_idx == sell_idx or price <= stop_price
+                    take_profit_price = trade.entry_price * (1 + take_profit)
+                    exit_signal = action_idx == sell_idx
+                    exit_take_profit = price >= take_profit_price
+                    exit_trailing = price <= stop_price
+                    should_exit = exit_signal or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -878,7 +883,13 @@ def run(args: argparse.Namespace) -> None:
                             tag="exit_long",
                         )
                         pnl = compute_net_percent_pnl(True, trade.entry_price, price, trade.quantity, exchange)
-                        exit_reason = "signal" if action_idx == sell_idx else "trailing_stop"
+                        exit_reason = (
+                            "signal"
+                            if exit_signal
+                            else "take_profit"
+                            if exit_take_profit
+                            else "trailing_stop"
+                        )
                         if args.verbose:
                             print(
                                 f"[trade] Exit long {ticker} via {exit_reason} | qty={trade.quantity} "
@@ -905,7 +916,11 @@ def run(args: argparse.Namespace) -> None:
                         )
                 elif trade.direction == status_short_label:
                     stop_price = trade.lowest_price * (1 + trailing_stop)
-                    should_exit = action_idx == buy_idx or price >= stop_price
+                    take_profit_price = trade.entry_price * (1 - take_profit)
+                    exit_signal = action_idx == buy_idx
+                    exit_take_profit = price <= take_profit_price
+                    exit_trailing = price >= stop_price
+                    should_exit = exit_signal or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -920,7 +935,13 @@ def run(args: argparse.Namespace) -> None:
                             tag="exit_short",
                         )
                         pnl = compute_net_percent_pnl(False, trade.entry_price, price, trade.quantity, exchange)
-                        exit_reason = "signal" if action_idx == buy_idx else "trailing_stop"
+                        exit_reason = (
+                            "signal"
+                            if exit_signal
+                            else "take_profit"
+                            if exit_take_profit
+                            else "trailing_stop"
+                        )
                         if args.verbose:
                             print(
                                 f"[trade] Exit short {ticker} via {exit_reason} | qty={trade.quantity} "

@@ -22,7 +22,16 @@ from replay import (
     populate_evaluation_replay_memory,
     populate_training_replay_memory,
 )
-from tune_trailing_stop_loss import DEFAULT_CANDIDATES, DEFAULT_METRIC, tune_trailing_stop_loss
+from tune_take_profit import (
+    DEFAULT_CANDIDATES as TAKE_PROFIT_CANDIDATES,
+    DEFAULT_METRIC as TAKE_PROFIT_METRIC,
+    tune_take_profit,
+)
+from tune_trailing_stop_loss import (
+    DEFAULT_CANDIDATES as TRAILING_STOP_CANDIDATES,
+    DEFAULT_METRIC as TRAILING_STOP_METRIC,
+    tune_trailing_stop_loss,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -61,11 +70,23 @@ def _run_trailing_stop_tuning(verbose: bool) -> None:
     try:
         cfg = load_config()
         tuning_cfg = cfg.get("tuning", {})
-        candidates = [float(v) for v in tuning_cfg.get("trailing_stop_candidates", DEFAULT_CANDIDATES)]
-        metric = str(tuning_cfg.get("trailing_stop_metric", DEFAULT_METRIC)).lower()
+        candidates = [float(v) for v in tuning_cfg.get("trailing_stop_candidates", TRAILING_STOP_CANDIDATES)]
+        metric = str(tuning_cfg.get("trailing_stop_metric", TRAILING_STOP_METRIC)).lower()
         tune_trailing_stop_loss(candidates, metric, verbose=verbose)
     except Exception as exc:  # noqa: BLE001
         print(f"[train] Trailing stop tuning failed: {exc}")
+
+
+def _run_take_profit_tuning(verbose: bool) -> None:
+    """Re-evaluate evaluation take profit pct after promoting a new winner."""
+    try:
+        cfg = load_config()
+        tuning_cfg = cfg.get("tuning", {})
+        candidates = [float(v) for v in tuning_cfg.get("take_profit_candidates", TAKE_PROFIT_CANDIDATES)]
+        metric = str(tuning_cfg.get("take_profit_metric", TAKE_PROFIT_METRIC)).lower()
+        tune_take_profit(candidates, metric, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[train] Take profit tuning failed: {exc}")
 
 
 def _promote_checkpoint(
@@ -188,6 +209,7 @@ def main() -> None:
                     verbose=args.verbose,
                 )
                 _run_trailing_stop_tuning(verbose=args.verbose)
+                _run_take_profit_tuning(verbose=args.verbose)
             elif args.verbose:
                 print("[train] Existing winner checkpoint still better; no promotion.")
 

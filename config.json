@@ -69,13 +69,15 @@
     "buy",
     "sell"
   ],
-  "training_days_num": 25,
-  "evaluation_days_num": 5,
+  "training_days_num": 1,
+  "evaluation_days_num": 1,
   "safe_start_time": "09:20",
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
   "training_trailing_stop_loss_pct": 1.0,
-  "evaluation_trailing_stop_loss_pct": 0.01,
+  "evaluation_trailing_stop_loss_pct": 0.0075,
+  "training_take_profit_pct": 1.0,
+  "evaluation_take_profit_pct": 0.03,
   "tuning": {
     "trailing_stop_candidates": [
       0.0025,
@@ -87,7 +89,18 @@
       0.03,
       0.05
     ],
-    "trailing_stop_metric": "avg_pct_pnl"
+    "trailing_stop_metric": "avg_pct_pnl",
+    "take_profit_candidates": [
+      0.0025,
+      0.005,
+      0.0075,
+      0.01,
+      0.015,
+      0.02,
+      0.03,
+      0.05
+    ],
+    "take_profit_metric": "avg_pct_pnl"
   },
   "max_concurrent_trades": 5,
   "capital_per_ticker": 10000,
@@ -108,7 +121,7 @@
     "hidden_layers_num": 5,
     "learning_rate": 0.0001,
     "batch_size": 64,
-    "epochs": 20
+    "epochs": 1
   },
   "train": {
     "lookback": 5,

@@ -721,6 +721,10 @@ def _generate_replay_memory(
         "training_trailing_stop_loss_pct" if mode == "training" else "evaluation_trailing_stop_loss_pct"
     )
     trailing_stop = float(config.get(trailing_stop_key))
+    take_profit_key = (
+        "training_take_profit_pct" if mode == "training" else "evaluation_take_profit_pct"
+    )
+    take_profit = float(config.get(take_profit_key))
     max_concurrent_trades = int(config.get("max_concurrent_trades"))
     capital_per_ticker = float(config.get("capital_per_ticker"))
     leverage = float(config.get("leverage"))
@@ -769,6 +773,7 @@ def _generate_replay_memory(
             print(
                 "[config:reward] reward_fn=proximity_cubic | "
                 f"trailing_stop={trailing_stop:.4f} | "
+                f"take_profit={take_profit:.4f} | "
                 f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
                 f"shorting_allowed={'short' in trade_status_list}"
             )
@@ -885,8 +890,10 @@ def _generate_replay_memory(
     entry_short = 0
     exit_long_signal = 0
     exit_long_trail = 0
+    exit_long_take_profit = 0
     exit_short_signal = 0
     exit_short_trail = 0
+    exit_short_take_profit = 0
     state_action_counts = {
         "flat": {"hold": 0, "buy": 0, "sell": 0},
         "long": {"hold": 0, "buy": 0, "sell": 0},
@@ -1213,20 +1220,32 @@ def _generate_replay_memory(
                 if trade.direction == status_long_label:
                     trade.highest_price = max(trade.highest_price, price)
                     stop_price = trade.highest_price * (1 - trailing_stop)
-                    if action_idx == sell_idx or price <= stop_price:
+                    take_profit_price = trade.entry_price * (1 + take_profit)
+                    exit_signal = action_idx == sell_idx
+                    exit_take_profit = price >= take_profit_price
+                    exit_trailing = price <= stop_price
+                    if exit_signal or exit_take_profit or exit_trailing:
+                        reason = (
+                            "signal"
+                            if exit_signal
+                            else "take_profit"
+                            if exit_take_profit
+                            else "trailing_stop"
+                        )
                         executed_events.append(
                             {
                                 "type": "exit",
-                                "reason": "signal" if action_idx == sell_idx else "trailing_stop",
+                                "reason": reason,
                                 "ticker": ticker,
                                 "action": sell_label,
                                 "price": price,
                                 "quantity": trade.quantity,
                             }
                         )
-                        reason = executed_events[-1].get("reason", "n/a")
                         if reason == "signal":
                             exit_long_signal += 1
+                        elif reason == "take_profit":
+                            exit_long_take_profit += 1
                         elif reason == "trailing_stop":
                             exit_long_trail += 1
                         pending_reward_logs.append((ticker, trade, price, ts, list(executed_events)))
@@ -1245,20 +1264,32 @@ def _generate_replay_memory(
                 elif trade.direction == status_short_label:
                     trade.lowest_price = min(trade.lowest_price, price)
                     stop_price = trade.lowest_price * (1 + trailing_stop)
-                    if action_idx == buy_idx or price >= stop_price:
+                    take_profit_price = trade.entry_price * (1 - take_profit)
+                    exit_signal = action_idx == buy_idx
+                    exit_take_profit = price <= take_profit_price
+                    exit_trailing = price >= stop_price
+                    if exit_signal or exit_take_profit or exit_trailing:
+                        reason = (
+                            "signal"
+                            if exit_signal
+                            else "take_profit"
+                            if exit_take_profit
+                            else "trailing_stop"
+                        )
                         executed_events.append(
                             {
                                 "type": "exit",
-                                "reason": "signal" if action_idx == buy_idx else "trailing_stop",
+                                "reason": reason,
                                 "ticker": ticker,
                                 "action": buy_label,
                                 "price": price,
                                 "quantity": trade.quantity,
                             }
                         )
-                        reason = executed_events[-1].get("reason", "n/a")
                         if reason == "signal":
                             exit_short_signal += 1
+                        elif reason == "take_profit":
+                            exit_short_take_profit += 1
                         elif reason == "trailing_stop":
                             exit_short_trail += 1
                         pending_reward_logs.append((ticker, trade, price, ts, list(executed_events)))
@@ -1438,8 +1469,10 @@ def _generate_replay_memory(
             )
             print(
                 f"[diag:exec_mix] open_long={entry_long} open_short={entry_short} "
-                f"exit_long_signal={exit_long_signal} exit_long_trailing_stop={exit_long_trail} "
-                f"exit_short_signal={exit_short_signal} exit_short_trailing_stop={exit_short_trail}"
+                f"exit_long_signal={exit_long_signal} exit_long_take_profit={exit_long_take_profit} "
+                f"exit_long_trailing_stop={exit_long_trail} exit_short_signal={exit_short_signal} "
+                f"exit_short_take_profit={exit_short_take_profit} "
+                f"exit_short_trailing_stop={exit_short_trail}"
             )
         safe_min = min_reward if min_reward != float("inf") else 0.0
         safe_max = max_reward if max_reward != float("-inf") else 0.0

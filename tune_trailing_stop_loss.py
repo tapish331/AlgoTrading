@@ -73,6 +73,10 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
 
     base_config = load_config(CONFIG_PATH)
     original_config = copy.deepcopy(base_config)
+    training_tp_raw = base_config.get("training_take_profit_pct")
+    if training_tp_raw is None:
+        raise ValueError("Config must define 'training_take_profit_pct' for trailing stop tuning.")
+    training_take_profit = float(training_tp_raw)
     best_value = None
     best_score = float("-inf")
     best_summary: Dict[str, Any] = {}
@@ -81,18 +85,21 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
     if verbose:
         joined = ", ".join(f"{c:.4f}" for c in candidates)
         print(f"[tune] Evaluating {len(candidates)} trailing stop values: [{joined}] using metric '{metric}'")
+        print(f"[tune] Fixed evaluation_take_profit_pct={training_take_profit:.4f} (from training_take_profit_pct)")
 
     try:
         for idx, candidate in enumerate(candidates, start=1):
             working_config = copy.deepcopy(base_config)
-            working_config.setdefault("tuning", {})["trailing_stop_candidates"] = candidates
             working_config["evaluation_trailing_stop_loss_pct"] = candidate
             _write_config(working_config, CONFIG_PATH, verbose=verbose)
 
             if verbose:
                 print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with trailing_stop={candidate:.4f}")
 
-            summary = populate_evaluation_replay_memory(verbose=verbose)
+            summary = populate_evaluation_replay_memory(
+                verbose=verbose,
+                override_take_profit=training_take_profit,
+            )
             score = _score_summary(summary, metric)
             results.append((candidate, score))
 
@@ -117,9 +124,7 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
         raise RuntimeError("Unable to determine best trailing stop value; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)
-    final_config.setdefault("tuning", {})["trailing_stop_candidates"] = candidates
     final_config["evaluation_trailing_stop_loss_pct"] = best_value
-    final_config["tuning"]["trailing_stop_metric"] = metric
     _write_config(final_config, CONFIG_PATH, verbose=verbose)
 
     if verbose:

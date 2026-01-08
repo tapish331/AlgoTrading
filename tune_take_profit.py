@@ -73,6 +73,10 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
 
     base_config = load_config(CONFIG_PATH)
     original_config = copy.deepcopy(base_config)
+    training_ts_raw = base_config.get("training_trailing_stop_loss_pct")
+    if training_ts_raw is None:
+        raise ValueError("Config must define 'training_trailing_stop_loss_pct' for take profit tuning.")
+    training_trailing_stop = float(training_ts_raw)
     best_value = None
     best_score = float("-inf")
     best_summary: Dict[str, Any] = {}
@@ -81,18 +85,24 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
     if verbose:
         joined = ", ".join(f"{c:.4f}" for c in candidates)
         print(f"[tune] Evaluating {len(candidates)} take profit values: [{joined}] using metric '{metric}'")
+        print(
+            f"[tune] Fixed evaluation_trailing_stop_loss_pct={training_trailing_stop:.4f} "
+            "(from training_trailing_stop_loss_pct)"
+        )
 
     try:
         for idx, candidate in enumerate(candidates, start=1):
             working_config = copy.deepcopy(base_config)
-            working_config.setdefault("tuning", {})["take_profit_candidates"] = candidates
             working_config["evaluation_take_profit_pct"] = candidate
             _write_config(working_config, CONFIG_PATH, verbose=verbose)
 
             if verbose:
                 print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with take_profit={candidate:.4f}")
 
-            summary = populate_evaluation_replay_memory(verbose=verbose)
+            summary = populate_evaluation_replay_memory(
+                verbose=verbose,
+                override_trailing_stop=training_trailing_stop,
+            )
             score = _score_summary(summary, metric)
             results.append((candidate, score))
 
@@ -117,9 +127,7 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
         raise RuntimeError("Unable to determine best take profit value; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)
-    final_config.setdefault("tuning", {})["take_profit_candidates"] = candidates
     final_config["evaluation_take_profit_pct"] = best_value
-    final_config["tuning"]["take_profit_metric"] = metric
     _write_config(final_config, CONFIG_PATH, verbose=verbose)
 
     if verbose:

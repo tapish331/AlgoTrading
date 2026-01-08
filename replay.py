@@ -674,6 +674,8 @@ def _generate_replay_memory(
     mode: str,
     output_path: Path,
     verbose: bool = False,
+    override_trailing_stop: Optional[float] = None,
+    override_take_profit: Optional[float] = None,
 ) -> None:
     config = load_config()
     tickers: List[str] = config.get("tickers", [])
@@ -725,6 +727,10 @@ def _generate_replay_memory(
         "training_take_profit_pct" if mode == "training" else "evaluation_take_profit_pct"
     )
     take_profit = float(config.get(take_profit_key))
+    if override_trailing_stop is not None:
+        trailing_stop = float(override_trailing_stop)
+    if override_take_profit is not None:
+        take_profit = float(override_take_profit)
     max_concurrent_trades = int(config.get("max_concurrent_trades"))
     capital_per_ticker = float(config.get("capital_per_ticker"))
     leverage = float(config.get("leverage"))
@@ -1567,7 +1573,11 @@ def _generate_replay_memory(
     }
 
 
-def populate_training_replay_memory(verbose: bool = False) -> Dict[str, Any]:
+def populate_training_replay_memory(
+    verbose: bool = False,
+    override_trailing_stop: Optional[float] = None,
+    override_take_profit: Optional[float] = None,
+) -> Dict[str, Any]:
     if verbose:
         print("[replay:training] Starting training replay generation")
 
@@ -1575,7 +1585,13 @@ def populate_training_replay_memory(verbose: bool = False) -> Dict[str, Any]:
     start_wall = _time.perf_counter()
     usage_start = _usage_snapshot()
 
-    summary = _generate_replay_memory("training", TRAINING_REPLAY_PATH, verbose=verbose)
+    summary = _generate_replay_memory(
+        "training",
+        TRAINING_REPLAY_PATH,
+        verbose=verbose,
+        override_trailing_stop=override_trailing_stop,
+        override_take_profit=override_take_profit,
+    )
 
     end_wall = _time.perf_counter()
     usage_end = _usage_snapshot()
@@ -1599,7 +1615,11 @@ def populate_training_replay_memory(verbose: bool = False) -> Dict[str, Any]:
     return summary
 
 
-def populate_evaluation_replay_memory(verbose: bool = False) -> Dict[str, Any]:
+def populate_evaluation_replay_memory(
+    verbose: bool = False,
+    override_trailing_stop: Optional[float] = None,
+    override_take_profit: Optional[float] = None,
+) -> Dict[str, Any]:
     if verbose:
         print("[replay:evaluation] Starting evaluation replay generation")
 
@@ -1607,7 +1627,13 @@ def populate_evaluation_replay_memory(verbose: bool = False) -> Dict[str, Any]:
     start_wall = _time.perf_counter()
     usage_start = _usage_snapshot()
 
-    summary = _generate_replay_memory("evaluation", EVALUATION_REPLAY_PATH, verbose=verbose)
+    summary = _generate_replay_memory(
+        "evaluation",
+        EVALUATION_REPLAY_PATH,
+        verbose=verbose,
+        override_trailing_stop=override_trailing_stop,
+        override_take_profit=override_take_profit,
+    )
 
     end_wall = _time.perf_counter()
     usage_end = _usage_snapshot()

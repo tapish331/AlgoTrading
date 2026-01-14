@@ -12,7 +12,7 @@ from replay import CONFIG_PATH, load_config, populate_evaluation_replay_memory
 
 # Default search space if config does not define one.
 DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
-DEFAULT_METRIC = "avg_pct_pnl"
+DEFAULT_METRIC = "pnl_tstat"
 
 
 def _write_config(config: Dict[str, Any], path: Path, verbose: bool) -> None:
@@ -59,8 +59,10 @@ def _parse_candidates(raw: str | None, config: Dict[str, Any]) -> List[float]:
 
 def _select_metric(args_metric: str | None, config: Dict[str, Any]) -> str:
     metric = (args_metric or config.get("tuning", {}).get("trailing_stop_metric") or DEFAULT_METRIC).lower()
-    if metric not in {"avg_reward", "avg_pct_pnl"}:
-        raise ValueError(f"Unsupported metric '{metric}'. Choose from ['avg_reward', 'avg_pct_pnl'].")
+    if metric not in {"avg_reward", "avg_pct_pnl", "pnl_tstat"}:
+        raise ValueError(
+            "Unsupported metric '%s'. Choose from ['avg_reward', 'avg_pct_pnl', 'pnl_tstat']." % metric
+        )
     return metric
 
 
@@ -159,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--metric",
         type=str,
-        help="Metric to maximize when choosing the best trailing stop (avg_reward or avg_pct_pnl).",
+        help="Metric to maximize when choosing the best trailing stop (avg_reward, avg_pct_pnl, pnl_tstat).",
     )
     parser.add_argument(
         "--verbose",

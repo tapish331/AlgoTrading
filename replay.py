@@ -868,6 +868,14 @@ def _generate_replay_memory(
             "records": 0,
             "timestamps": 0,
             "avg_reward": 0.0,
+            "avg_pct_pnl": None,
+            "total_pct_pnl": None,
+            "std_pct_pnl": None,
+            "pnl_tstat": None,
+            "completed_trades": 0,
+            "positive_trades": 0,
+            "negative_trades": 0,
+            "flat_trades": 0,
             "path": output_path,
         }
 
@@ -909,6 +917,7 @@ def _generate_replay_memory(
     hold_minutes_total = 0.0
     hold_minutes_count = 0
     realized_pct_sum = 0.0
+    realized_pct_sq_sum = 0.0
     realized_pct_count = 0
     # sign distribution of realized trade PnL (evaluation only)
     realized_pct_pos_count = 0
@@ -927,11 +936,14 @@ def _generate_replay_memory(
             pass
 
     def _record_realized_pct(pct_value: float) -> None:
-        nonlocal realized_pct_sum, realized_pct_count, realized_pct_pos_count, realized_pct_neg_count, realized_pct_zero_count
+        nonlocal realized_pct_sum, realized_pct_sq_sum, realized_pct_count
+        nonlocal realized_pct_pos_count, realized_pct_neg_count, realized_pct_zero_count
         if mode != "evaluation":
             return
 
+        # Track sum and sum of squares for evaluation-only PnL t-statistics.
         realized_pct_sum += pct_value
+        realized_pct_sq_sum += pct_value * pct_value
         realized_pct_count += 1
 
         if pct_value > 0:
@@ -1433,9 +1445,29 @@ def _generate_replay_memory(
         if verbose and total_processed % 100 == 0:
             print(f"[replay:{mode}] Processed {total_processed} timestamps")
 
-    avg_pct_pnl = (
-        realized_pct_sum / realized_pct_count if (mode == "evaluation" and realized_pct_count) else None
-    )
+    avg_pct_pnl = None
+    total_pct_pnl = None
+    std_pct_pnl = None
+    pnl_tstat = None
+    if mode == "evaluation" and realized_pct_count:
+        total_pct_pnl = realized_pct_sum
+        avg_pct_pnl = realized_pct_sum / realized_pct_count
+        if realized_pct_count >= 2:
+            mean = avg_pct_pnl
+            variance = (realized_pct_sq_sum - realized_pct_count * mean * mean) / (realized_pct_count - 1)
+            variance = max(variance, 0.0)
+            std_pct_pnl = math.sqrt(variance)
+            if std_pct_pnl == 0.0:
+                if mean > 0:
+                    pnl_tstat = float("inf")
+                elif mean < 0:
+                    pnl_tstat = float("-inf")
+                else:
+                    pnl_tstat = 0.0
+            else:
+                pnl_tstat = mean / (std_pct_pnl / math.sqrt(realized_pct_count))
+        else:
+            pnl_tstat = 0.0
     if verbose:
         if selected_timestamps:
             first_ts, last_ts = selected_timestamps[0], selected_timestamps[-1]
@@ -1530,14 +1562,24 @@ def _generate_replay_memory(
                 reward_net = reward_accum
                 avg_pct_label = (
                     f"{avg_pct_pnl:.4f}% (n={realized_pct_count})"
-                    if avg_pct_pnl is not None
+                    if isinstance(avg_pct_pnl, (float, int))
                     else "n/a"
+                )
+                total_pct_label = (
+                    f"{total_pct_pnl:.4f}%" if isinstance(total_pct_pnl, (float, int)) else "n/a"
+                )
+                std_pct_label = (
+                    f"{std_pct_pnl:.4f}%" if isinstance(std_pct_pnl, (float, int)) else "n/a"
+                )
+                pnl_tstat_label = (
+                    f"{pnl_tstat:.4f}" if isinstance(pnl_tstat, (float, int)) else "n/a"
                 )
                 print(
                     f"[diag:eval] reward_net={reward_net:.4f}, trades={trades}, "
                     f"trades_per_day={trades_per_day:.2f} | avg_pct_pnl={avg_pct_label} | "
-                    f"trades_pos={realized_pct_pos_count}, trades_neg={realized_pct_neg_count}, "
-                    f"trades_zero={realized_pct_zero_count}"
+                    f"total_pct_pnl={total_pct_label} | std_pct_pnl={std_pct_label} | "
+                    f"pnl_tstat={pnl_tstat_label} | trades_pos={realized_pct_pos_count}, "
+                    f"trades_neg={realized_pct_neg_count}, trades_zero={realized_pct_zero_count}"
                 )
         else:
             fp_rows = []
@@ -1565,6 +1607,9 @@ def _generate_replay_memory(
         "timestamps": len(selected_timestamps),
         "avg_reward": avg_reward,
         "avg_pct_pnl": avg_pct_pnl,
+        "total_pct_pnl": total_pct_pnl,
+        "std_pct_pnl": std_pct_pnl,
+        "pnl_tstat": pnl_tstat,
         "completed_trades": realized_pct_count,
         "positive_trades": realized_pct_pos_count,
         "negative_trades": realized_pct_neg_count,

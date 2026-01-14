@@ -89,7 +89,7 @@
       0.03,
       0.05
     ],
-    "trailing_stop_metric": "avg_pct_pnl",
+    "trailing_stop_metric": "pnl_tstat",
     "take_profit_candidates": [
       0.0025,
       0.005,
@@ -100,7 +100,7 @@
       0.03,
       0.05
     ],
-    "take_profit_metric": "avg_pct_pnl"
+    "take_profit_metric": "pnl_tstat"
   },
   "max_concurrent_trades": 5,
   "capital_per_ticker": 10000,
@@ -125,6 +125,8 @@
   },
   "train": {
     "lookback": 5,
-    "mode": "RL"
+    "mode": "RL",
+    "promotion_metric": "pnl_tstat",
+    "promotion_fallback_metric": "avg_pct_pnl"
   }
 }

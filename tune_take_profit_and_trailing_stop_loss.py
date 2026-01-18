@@ -120,11 +120,6 @@ def tune_take_profit_and_trailing_stop_loss(
             product(trailing_candidates, take_profit_candidates),
             start=1,
         ):
-            working_config = copy.deepcopy(base_config)
-            working_config["evaluation_trailing_stop_loss_pct"] = trailing_stop
-            working_config["evaluation_take_profit_pct"] = take_profit
-            _write_config(working_config, CONFIG_PATH, verbose=verbose)
-
             if verbose:
                 print(
                     f"[tune] ({idx}/{total}) Running evaluation with "
@@ -152,11 +147,9 @@ def tune_take_profit_and_trailing_stop_loss(
                 best_pair = (trailing_stop, take_profit)
                 best_summary = summary
     except Exception:
-        _write_config(original_config, CONFIG_PATH, verbose=False)
         raise
 
     if best_pair is None:
-        _write_config(original_config, CONFIG_PATH, verbose=False)
         raise RuntimeError("Unable to determine best take profit + trailing stop pair; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)

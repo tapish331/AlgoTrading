@@ -91,10 +91,6 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
 
     try:
         for idx, candidate in enumerate(candidates, start=1):
-            working_config = copy.deepcopy(base_config)
-            working_config["evaluation_trailing_stop_loss_pct"] = candidate
-            _write_config(working_config, CONFIG_PATH, verbose=verbose)
-
             if verbose:
                 print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with trailing_stop={candidate:.4f}")
 
@@ -118,11 +114,9 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
                 best_value = candidate
                 best_summary = summary
     except Exception:
-        _write_config(original_config, CONFIG_PATH, verbose=False)
         raise
 
     if best_value is None:
-        _write_config(original_config, CONFIG_PATH, verbose=False)
         raise RuntimeError("Unable to determine best trailing stop value; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)

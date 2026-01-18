@@ -275,18 +275,48 @@ def fetch_history(
     else:
         start_ts = _parse_datetime(from_, "from")
         end_ts = _parse_datetime(to, "to")
-        if verbose:
-            print(
-                "[fetch_history] Requesting data "
-                f"{_format_ts_ist(start_ts)} -> {_format_ts_ist(end_ts)} @ {timeframe}"
+        max_window = _history_window_cap(timeframe)
+        span = end_ts - start_ts
+        if max_window is None or span <= max_window:
+            if verbose:
+                print(
+                    "[fetch_history] Requesting data "
+                    f"{_format_ts_ist(start_ts)} -> {_format_ts_ist(end_ts)} @ {timeframe}"
+                )
+            history = _request_history(
+                kite=client,
+                instrument_token=resolved_token,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                timeframe=timeframe,
             )
-        history = _request_history(
-            kite=client,
-            instrument_token=resolved_token,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            timeframe=timeframe,
-        )
+        else:
+            if verbose:
+                print(
+                    "[fetch_history] Requested span exceeds max window "
+                    f"({span} > {max_window}); chunking requests"
+                )
+            history = []
+            interval_delta = _interval_to_timedelta(timeframe)
+            chunk_start = start_ts
+            while chunk_start < end_ts:
+                chunk_end = min(chunk_start + max_window, end_ts)
+                if verbose:
+                    print(
+                        "[fetch_history] Requesting data "
+                        f"{_format_ts_ist(chunk_start)} -> {_format_ts_ist(chunk_end)} @ {timeframe}"
+                    )
+                chunk = _request_history(
+                    kite=client,
+                    instrument_token=resolved_token,
+                    start_ts=chunk_start,
+                    end_ts=chunk_end,
+                    timeframe=timeframe,
+                )
+                history = _merge_history_chunks(chunk, history)
+                if chunk_end >= end_ts:
+                    break
+                chunk_start = chunk_end - interval_delta
 
     if verbose:
         print(f"[fetch_history] Retrieved {len(history)} records")

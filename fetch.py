@@ -55,6 +55,7 @@ def write_history_csv(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = output_dir / "history.csv"
+    parquet_path = output_dir / "history.parquet"
     df = dataframe.copy()
     if not df.empty:
         df.sort_values(by="date", inplace=True)
@@ -75,6 +76,81 @@ def write_history_csv(
             )
         else:
             print(f"[fetch] {ticker} {timeframe} -> rows={len(df)} | file={output_path}")
+
+    # Best-effort Parquet write for faster replay loads.
+    try:
+        parquet_df = dataframe.copy()
+        if not parquet_df.empty and "date" in parquet_df.columns:
+            parquet_df["date"] = pd.to_datetime(parquet_df["date"], utc=True, errors="coerce")
+            parquet_df.dropna(subset=["date"], inplace=True)
+            parquet_df.sort_values(by="date", inplace=True)
+            parquet_df.reset_index(drop=True, inplace=True)
+        if not parquet_df.empty:
+            parquet_df.to_parquet(parquet_path, index=False)
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            print(f"[fetch] Parquet write failed for {ticker} {timeframe}: {exc}")
+
+
+def backfill_parquet(
+    base_dir: Path = DATA_DIR,
+    verbose: bool = False,
+    force: bool = False,
+) -> None:
+    """Generate history.parquet files for existing history.csv files."""
+    try:
+        import pyarrow  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "pyarrow is required for parquet backfill. Install with `pip install pyarrow`."
+        ) from exc
+
+    base_dir = base_dir.resolve()
+    if not base_dir.exists():
+        if verbose:
+            print(f"[fetch] No data directory found at {base_dir}")
+        return
+
+    csv_paths = sorted(base_dir.rglob("history.csv"))
+    if not csv_paths:
+        if verbose:
+            print(f"[fetch] No history.csv files found under {base_dir}")
+        return
+
+    failures = 0
+    updated = 0
+    skipped = 0
+    for csv_path in csv_paths:
+        parquet_path = csv_path.with_suffix(".parquet")
+        try:
+            if not force and parquet_path.exists():
+                try:
+                    if parquet_path.stat().st_mtime_ns >= csv_path.stat().st_mtime_ns:
+                        skipped += 1
+                        if verbose:
+                            print(f"[fetch] Parquet up to date for {csv_path}")
+                        continue
+                except OSError:
+                    pass
+            df = pd.read_csv(csv_path)
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+                df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+            df.to_parquet(parquet_path, index=False)
+            updated += 1
+            if verbose:
+                print(f"[fetch] Parquet written {parquet_path} (rows={len(df)})")
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"[fetch] Parquet backfill failed for {csv_path}: {exc}", file=sys.stderr)
+
+    if verbose:
+        print(
+            "[fetch] Parquet backfill complete | "
+            f"updated={updated} skipped={skipped} failed={failures}"
+        )
+    if failures:
+        raise RuntimeError(f"Parquet backfill failed for {failures} file(s).")
 
 
 def run_pipeline(verbose: bool = False) -> None:
@@ -118,34 +194,19 @@ def run_pipeline(verbose: bool = False) -> None:
         for timeframe in timeframes:
             if verbose:
                 print(f"[fetch]  -> Fetching timeframe {timeframe}")
-            existing_df = load_existing_history(
-                ticker=ticker,
-                timeframe=timeframe,
-                base_dir=base_dir,
-            )
-
-            initial_count = len(existing_df)
-            combined_df: pd.DataFrame
-
-            if existing_df.empty:
-                if verbose:
-                    print(f"[fetch]  -> No existing data, fetching {num_candles} candles from scratch")
-                candles = fetch_history(
+            try:
+                existing_df = load_existing_history(
                     ticker=ticker,
                     timeframe=timeframe,
-                    num_candles=num_candles,
-                    verbose=verbose,
+                    base_dir=base_dir,
                 )
-                new_df = _candles_to_dataframe(candles)
-                combined_df = new_df
-            else:
-                existing_count = len(existing_df)
-                if existing_count < num_candles:
+
+                initial_count = len(existing_df)
+                combined_df: pd.DataFrame
+
+                if existing_df.empty:
                     if verbose:
-                        print(
-                            "[fetch]  -> Backfilling older data "
-                            f"(have {existing_count}, need {num_candles})"
-                        )
+                        print(f"[fetch]  -> No existing data, fetching {num_candles} candles from scratch")
                     candles = fetch_history(
                         ticker=ticker,
                         timeframe=timeframe,
@@ -153,48 +214,69 @@ def run_pipeline(verbose: bool = False) -> None:
                         verbose=verbose,
                     )
                     new_df = _candles_to_dataframe(candles)
-                    combined_df = _merge_existing_and_new(existing_df, new_df)
+                    combined_df = new_df
                 else:
-                    last_dt = _ensure_datetime(existing_df["date"].max())
-                    timeframe_delta = _timeframe_to_timedelta(timeframe)
-                    fetch_from_dt = last_dt - timeframe_delta if timeframe_delta else last_dt
-                    now_dt = datetime.now(timezone.utc)
-
-                    if fetch_from_dt >= now_dt:
+                    existing_count = len(existing_df)
+                    if existing_count < num_candles:
                         if verbose:
-                            print("[fetch]  -> No new data available (timestamps up to date)")
-                        combined_df = existing_df
-                    else:
+                            print(
+                                "[fetch]  -> Backfilling older data "
+                                f"(have {existing_count}, need {num_candles})"
+                            )
                         candles = fetch_history(
                             ticker=ticker,
                             timeframe=timeframe,
-                            from_=_timestamp_to_iso(fetch_from_dt),
-                            to=_timestamp_to_iso(now_dt),
+                            num_candles=num_candles,
                             verbose=verbose,
                         )
                         new_df = _candles_to_dataframe(candles)
                         combined_df = _merge_existing_and_new(existing_df, new_df)
+                    else:
+                        last_dt = _ensure_datetime(existing_df["date"].max())
+                        timeframe_delta = _timeframe_to_timedelta(timeframe)
+                        fetch_from_dt = last_dt - timeframe_delta if timeframe_delta else last_dt
+                        now_dt = datetime.now(timezone.utc)
 
-            if combined_df is None or combined_df.empty:
-                if verbose:
-                    print("[fetch]  -> No data to write")
+                        if fetch_from_dt >= now_dt:
+                            if verbose:
+                                print("[fetch]  -> No new data available (timestamps up to date)")
+                            combined_df = existing_df
+                        else:
+                            candles = fetch_history(
+                                ticker=ticker,
+                                timeframe=timeframe,
+                                from_=_timestamp_to_iso(fetch_from_dt),
+                                to=_timestamp_to_iso(now_dt),
+                                verbose=verbose,
+                            )
+                            new_df = _candles_to_dataframe(candles)
+                            combined_df = _merge_existing_and_new(existing_df, new_df)
+
+                if combined_df is None or combined_df.empty:
+                    if verbose:
+                        print("[fetch]  -> No data to write")
+                    continue
+
+                combined_count = len(combined_df)
+                updated = combined_count > initial_count
+
+                if not updated:
+                    if verbose:
+                        print("[fetch]  -> No new candles detected; keeping existing data")
+                    continue
+
+                write_history_csv(
+                    ticker=ticker,
+                    timeframe=timeframe,
+                    dataframe=combined_df,
+                    base_dir=base_dir,
+                    verbose=verbose,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[fetch] Error fetching {ticker} {timeframe}: {exc}", file=sys.stderr)
                 continue
 
-            combined_count = len(combined_df)
-            updated = combined_count > initial_count
-
-            if not updated:
-                if verbose:
-                    print("[fetch]  -> No new candles detected; keeping existing data")
-                continue
-
-            write_history_csv(
-                ticker=ticker,
-                timeframe=timeframe,
-                dataframe=combined_df,
-                base_dir=base_dir,
-                verbose=verbose,
-            )
+    backfill_parquet(base_dir=base_dir, verbose=verbose, force=True)
 
     if verbose:
         print("[fetch] Completed historical data download")
@@ -273,6 +355,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Refresh NSE tickers, ensure broker auth, and fetch historical data."
     )
     parser.add_argument(
+        "--backfill_parquet",
+        action="store_true",
+        help="Generate history.parquet for existing history.csv files and exit.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging for the fetch pipeline.",
@@ -285,6 +372,9 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.backfill_parquet:
+            backfill_parquet(verbose=args.verbose)
+            return 0
         run_pipeline(verbose=args.verbose)
     except Exception as exc:  # noqa: BLE001
         print(f"[fetch] Error: {exc}", file=sys.stderr)

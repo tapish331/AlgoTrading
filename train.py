@@ -39,7 +39,7 @@ def _compute_dataset_signature() -> str:
     hasher = hashlib.sha256()
     if not DATA_DIR.exists():
         return ""
-    for path in sorted(DATA_DIR.rglob("*.csv")):
+    for path in sorted(DATA_DIR.rglob("*.parquet")):
         stat = path.stat()
         hasher.update(str(path.relative_to(BASE_DIR)).encode())
         hasher.update(str(stat.st_mtime_ns).encode())

@@ -35,6 +35,8 @@ EVALUATION_REPLAY_PATH = DATA_ROOT / "replay_memory_evaluation.jsonl"
 INDIA_TZ = ZoneInfo("Asia/Kolkata")
 MODEL_ACTIONS = ["hold", "buy", "sell"]
 
+_HISTORY_CACHE: Dict[Path, Tuple[int, int, pd.DataFrame]] = {}
+
 ZERODHA_BROKERAGE_PCT = 0.0003  # 0.03%
 ZERODHA_BROKERAGE_CAP = 20.0  # Rs per executed order
 ZERODHA_STT_PCT = 0.00025  # 0.025% on sell side
@@ -131,16 +133,28 @@ def build_model(
     return model
 
 
-def load_history_for_ticker_timeframe(ticker: str, timeframe: str) -> pd.DataFrame:
-    file_path = DATA_ROOT / ticker / timeframe / "history.csv"
-    if not file_path.exists():
-        raise FileNotFoundError(f"Missing historical data at {file_path}")
-    df = pd.read_csv(file_path)
+def _load_history_frame(file_path: Path) -> pd.DataFrame:
+    stat = file_path.stat()
+    cached = _HISTORY_CACHE.get(file_path)
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    df = pd.read_parquet(file_path)
     if "date" not in df.columns:
         raise ValueError(f"'date' column missing in {file_path}")
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    _HISTORY_CACHE[file_path] = (stat.st_mtime_ns, stat.st_size, df)
     return df
+
+
+def load_history_for_ticker_timeframe(ticker: str, timeframe: str) -> pd.DataFrame:
+    parquet_path = DATA_ROOT / ticker / timeframe / "history.parquet"
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"Missing historical data at {parquet_path}. "
+            "Run fetch.py to generate Parquet history files."
+        )
+    return _load_history_frame(parquet_path)
 
 
 def load_all_history(

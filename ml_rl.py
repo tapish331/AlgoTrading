@@ -238,7 +238,7 @@ if _TORCH_IMPORT_ERROR is None:
             Amean = Ahat.mean(dim=1, keepdim=True)  # [B, 1, K]
             Q = V.unsqueeze(1) + (Ahat - Amean)  # [B, A, K]
             mask = self.action_mask(x)
-            Q = Q * mask
+            Q = Q.masked_fill(mask == 0, -1e9)
             return Q
 
         @torch.no_grad()

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+from logging.handlers import TimedRotatingFileHandler
 import sys
 import threading
 import time
+import warnings
 from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -16,6 +19,7 @@ import pandas as pd
 from fetch import run_pipeline as fetch_run_pipeline
 from ml_rl import LightRainbowDQN, torch  # type: ignore[attr-defined]
 from replay import (
+    CONFIG_PATH,
     INDIA_TZ,
     MODEL_ACTIONS,
     Trade,
@@ -43,6 +47,194 @@ DEFAULT_WINNER_CHECKPOINT = Path("checkpoints/light_rainbow_winner.pt")
 STATE_DIR = Path("state")
 ACTIVE_TRADES_PATH = STATE_DIR / "active_trades.json"
 COMPLETED_TRADES_DIR = STATE_DIR / "completed_trades"
+DEFAULT_LOG_DIR = Path("logs")
+DEFAULT_LOG_FILE_PREFIX = "trade"
+DEFAULT_LOG_RETENTION_DAYS = 5
+DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_VERBOSE_LOG_LEVEL = "DEBUG"
+
+_ORIGINAL_STDOUT: Optional[Any] = None
+_ORIGINAL_STDERR: Optional[Any] = None
+
+
+class _ConsoleFilter(logging.Filter):
+    """Drop file-only records so stdout/stderr tees don't double-print."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 - succinct
+        return not getattr(record, "file_only", False)
+
+
+class _StreamTee:
+    """Duplicate writes to a stream and the log file, without echoing twice."""
+
+    def __init__(self, stream: Any, logger: logging.Logger, level: int, *, file_only: bool) -> None:
+        self._stream = stream
+        self._logger = logger
+        self._level = level
+        self._file_only = file_only
+        self._buffer: str = ""
+
+    def write(self, message: Any) -> int:
+        if message is None:
+            return 0
+        if not isinstance(message, str):
+            message = str(message)
+        self._stream.write(message)
+        self._buffer += message
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                self._logger.log(
+                    self._level,
+                    line,
+                    extra={"file_only": self._file_only},
+                )
+        return len(message)
+
+    def flush(self) -> None:
+        if self._buffer:
+            line = self._buffer.rstrip("\n")
+            if line.strip():
+                self._logger.log(
+                    self._level,
+                    line,
+                    extra={"file_only": self._file_only},
+                )
+        self._buffer = ""
+        self._stream.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def _normalize_log_level(value: Any, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if not value:
+        return default
+    lookup = {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "NOTSET": logging.NOTSET,
+    }
+    return lookup.get(str(value).strip().upper(), default)
+
+
+def _load_logging_config(path: Path) -> tuple[Dict[str, Any], Optional[str]]:
+    if not path.exists():
+        return {}, f"Config file missing at {path}"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        logging_cfg = payload.get("logging", {})
+        if isinstance(logging_cfg, dict):
+            return logging_cfg, None
+        return {}, "Config 'logging' section is not a dict"
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"Failed to read logging config ({exc})"
+
+
+def _cleanup_old_logs(
+    log_dir: Path,
+    prefix: str,
+    retention_days: int,
+    *,
+    verbose: bool,
+) -> None:
+    if retention_days <= 0:
+        retention_days = 1
+    if not log_dir.exists():
+        return
+    cutoff = time.time() - (retention_days * 86400)
+    removed = 0
+    for path in log_dir.glob(f"{prefix}.log*"):
+        try:
+            if not path.is_file():
+                continue
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    if verbose and removed:
+        print(f"[trade] Cleaned up {removed} old log file(s) in {log_dir}")
+
+
+def _setup_logging(verbose: bool) -> logging.Logger:
+    global _ORIGINAL_STDOUT, _ORIGINAL_STDERR
+
+    if _ORIGINAL_STDOUT is None:
+        _ORIGINAL_STDOUT = sys.stdout
+    if _ORIGINAL_STDERR is None:
+        _ORIGINAL_STDERR = sys.stderr
+
+    logging_cfg, logging_error = _load_logging_config(CONFIG_PATH)
+    log_dir = Path(logging_cfg.get("dir", DEFAULT_LOG_DIR))
+    file_prefix = str(logging_cfg.get("file_prefix", DEFAULT_LOG_FILE_PREFIX)).strip() or DEFAULT_LOG_FILE_PREFIX
+    retention_days = int(logging_cfg.get("retention_days", DEFAULT_LOG_RETENTION_DAYS) or DEFAULT_LOG_RETENTION_DAYS)
+    base_level = logging_cfg.get("level", DEFAULT_LOG_LEVEL)
+    verbose_level = logging_cfg.get("verbose_level", DEFAULT_VERBOSE_LOG_LEVEL)
+    console_level = _normalize_log_level(verbose_level if verbose else base_level, logging.INFO)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{file_prefix}.log"
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console_handler = logging.StreamHandler(stream=_ORIGINAL_STDOUT)
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(_ConsoleFilter())
+
+    file_handler = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        backupCount=retention_days,
+        encoding="utf-8",
+        delay=True,
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    file_handler.suffix = "%Y-%m-%d"
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    logging.captureWarnings(True)
+    warnings.simplefilter("default")
+
+    if not isinstance(sys.stdout, _StreamTee):
+        sys.stdout = _StreamTee(_ORIGINAL_STDOUT, logger, logging.INFO, file_only=True)
+    if not isinstance(sys.stderr, _StreamTee):
+        sys.stderr = _StreamTee(_ORIGINAL_STDERR, logger, logging.ERROR, file_only=True)
+
+    _cleanup_old_logs(log_dir, file_prefix, retention_days, verbose=verbose)
+
+    if verbose:
+        print(
+            "[trade] Logging to console and daily file | "
+            f"path={log_path} retention_days={retention_days} level={logging.getLevelName(console_level)}"
+        )
+        if logging_error:
+            print(f"[trade] Logging config warning: {logging_error}")
+
+    return logger
 
 
 def _ist_iso_from_any(value: Optional[Any]) -> Optional[str]:
@@ -1163,6 +1355,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    try:
+        _setup_logging(args.verbose)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[trade] Warning: logging setup failed ({exc})", file=sys.stderr)
     try:
         run(args)
     except KeyboardInterrupt:

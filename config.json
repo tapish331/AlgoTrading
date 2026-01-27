@@ -74,9 +74,9 @@
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
   "training_trailing_stop_loss_pct": 1.0,
-  "evaluation_trailing_stop_loss_pct": 1.0,
+  "evaluation_trailing_stop_loss_pct": 0.0075,
   "training_take_profit_pct": 1.0,
-  "evaluation_take_profit_pct": 1.0,
+  "evaluation_take_profit_pct": 0.005,
   "tuning": {
     "trailing_stop_candidates": [
       0.0025,
@@ -100,6 +100,13 @@
   "trading": {
     "mode": "paper",
     "poll_interval_seconds": 1
+  },
+  "logging": {
+    "dir": "logs",
+    "file_prefix": "trade",
+    "retention_days": 5,
+    "level": "INFO",
+    "verbose_level": "DEBUG"
   },
   "trade_status": [
     "flat",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import argparse
 import json
 import math
@@ -707,6 +708,14 @@ def _generate_replay_memory(
     if not timeframes:
         raise ValueError("No timeframes configured in config.json")
 
+    if mode == "training":
+        ENTRY_CONFIRM_WINDOW = int(config.get("training_entry_confirm_window", 1))
+    else:
+        ENTRY_CONFIRM_WINDOW = int(config.get("evaluation_entry_confirm_window", 3))
+    ENTRY_CONFIRM_WINDOW = max(ENTRY_CONFIRM_WINDOW, 1)
+    entry_action_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
+    entry_conf_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
+
     action_labels: List[str] = config.get("actions", [])
     if not action_labels:
         raise ValueError("Config must define an 'actions' list.")
@@ -1117,6 +1126,35 @@ def _generate_replay_memory(
             if not is_legal:
                 result["action_idx"] = hold_idx
                 result["action"] = model_to_config_label.get(hold_idx, "hold")
+
+        for ticker, result in inference_results.items():
+            st_idx = trade_status_indices.get(ticker, flat_status_idx)
+            if st_idx != flat_status_idx:
+                continue
+
+            entry_action_hist[ticker].append(int(result.get("action_idx", hold_idx)))
+            entry_conf_hist[ticker].append(float(result.get("confidence", 0.0)))
+
+            if ENTRY_CONFIRM_WINDOW <= 1:
+                continue
+
+            if len(entry_action_hist[ticker]) < ENTRY_CONFIRM_WINDOW:
+                confirmed = hold_idx
+            else:
+                window = list(entry_action_hist[ticker])
+                confirmed = (
+                    window[0]
+                    if (window[0] != hold_idx and all(a == window[0] for a in window))
+                    else hold_idx
+                )
+
+            result["action_idx"] = confirmed
+            result["action"] = model_to_config_label.get(confirmed, "hold")
+            result["confidence"] = (
+                sum(entry_conf_hist[ticker]) / ENTRY_CONFIRM_WINDOW
+                if confirmed != hold_idx
+                else 0.0
+            )
 
         for ticker, result in inference_results.items():
             ai = int(result.get("action_idx", 2))

@@ -70,6 +70,8 @@
   ],
   "training_days_num": 25,
   "evaluation_days_num": 5,
+  "training_entry_confirm_window": 3,
+  "evaluation_entry_confirm_window": 3,
   "safe_start_time": "09:20",
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
@@ -99,7 +101,8 @@
   "leverage": 5.0,
   "trading": {
     "mode": "paper",
-    "poll_interval_seconds": 1
+    "poll_interval_seconds": 1,
+    "entry_confirm_window": 3
   },
   "logging": {
     "dir": "logs",

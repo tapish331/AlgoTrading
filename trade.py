@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import argparse
 import json
 import logging
@@ -845,6 +846,10 @@ def run(args: argparse.Namespace) -> None:
     buy_idx = MODEL_ACTIONS.index("buy")
     sell_idx = MODEL_ACTIONS.index("sell")
     hold_idx = MODEL_ACTIONS.index("hold")
+    ENTRY_CONFIRM_WINDOW = max(int(trading_cfg.get("entry_confirm_window", 3)), 1)
+    entry_action_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
+    entry_conf_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
+    last_seen_signal_ts = {t: None for t in tickers}
 
     trade_status_list: list[str] = config.get("trade_status", [])
     status_long_label = _require_label(trade_status_list, "long")
@@ -1015,9 +1020,43 @@ def run(args: argparse.Namespace) -> None:
                 continue
     
             inference = infer_actions(model, ticker_features, model_to_config_label)
+            entry_inference = {t: dict(res) for t, res in inference.items()}
+            for ticker, res in entry_inference.items():
+                if ticker in active_trades:
+                    res["action_idx"] = hold_idx
+                    res["action"] = model_to_config_label.get(hold_idx, "hold")
+                    res["confidence"] = 0.0
+                    continue
+
+                sig_ts = signal_timestamps.get(ticker)
+                if sig_ts is None or sig_ts == last_seen_signal_ts.get(ticker):
+                    pass
+                else:
+                    last_seen_signal_ts[ticker] = sig_ts
+                    entry_action_hist[ticker].append(int(res.get("action_idx", hold_idx)))
+                    entry_conf_hist[ticker].append(float(res.get("confidence", 0.0)))
+
+                if len(entry_action_hist[ticker]) < ENTRY_CONFIRM_WINDOW:
+                    confirmed = hold_idx
+                else:
+                    window = list(entry_action_hist[ticker])
+                    confirmed = (
+                        window[0]
+                        if (window[0] != hold_idx and all(a == window[0] for a in window))
+                        else hold_idx
+                    )
+
+                res["action_idx"] = confirmed
+                res["action"] = model_to_config_label.get(confirmed, "hold")
+                res["confidence"] = (
+                    sum(entry_conf_hist[ticker]) / ENTRY_CONFIRM_WINDOW
+                    if confirmed != hold_idx
+                    else 0.0
+                )
+
             actionable = [
                 (ticker, data)
-                for ticker, data in inference.items()
+                for ticker, data in entry_inference.items()
                 if int(data.get("action_idx", hold_idx)) != hold_idx
             ]
             max_conf_ticker = (

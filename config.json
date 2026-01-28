@@ -107,6 +107,8 @@
   "logging": {
     "dir": "logs",
     "file_prefix": "trade",
+    "file_prefix_train": "train",
+    "file_prefix_fetch": "fetch",
     "retention_days": 1,
     "level": "INFO",
     "verbose_level": "DEBUG"

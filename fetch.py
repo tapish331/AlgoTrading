@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -18,6 +19,43 @@ from zerodha_broker import ensure_access_token, fetch_history
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 # Directory where historical datasets are persisted.
 DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_LOG_DIR = Path("logs")
+DEFAULT_LOG_FILE_PREFIX = "fetch"
+
+
+def _load_logging_config(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        logging_cfg = payload.get("logging", {})
+        if isinstance(logging_cfg, dict):
+            return logging_cfg
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_fatal_error(exc: BaseException) -> None:
+    logging_cfg = _load_logging_config(CONFIG_PATH)
+    log_dir = Path(logging_cfg.get("dir", DEFAULT_LOG_DIR))
+    file_prefix_raw = (
+        logging_cfg.get("file_prefix_fetch")
+        or logging_cfg.get("file_prefix")
+        or DEFAULT_LOG_FILE_PREFIX
+    )
+    file_prefix = str(file_prefix_raw).strip() or DEFAULT_LOG_FILE_PREFIX
+    log_path = log_dir / f"{file_prefix}.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+        message = f"{timestamp} | ERROR | Fatal error: {exc}\n{trace}\n"
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write(message)
+    except OSError as write_exc:
+        print(f"[fetch] Failed to write fatal error log: {write_exc}", file=sys.stderr)
 
 
 def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, object]:
@@ -378,6 +416,7 @@ def main(argv: List[str] | None = None) -> int:
         run_pipeline(verbose=args.verbose)
     except Exception as exc:  # noqa: BLE001
         print(f"[fetch] Error: {exc}", file=sys.stderr)
+        _write_fatal_error(exc)
         return 1
     return 0
 

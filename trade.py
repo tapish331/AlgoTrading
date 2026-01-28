@@ -6,10 +6,10 @@ from collections import deque
 import argparse
 import json
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import sys
 import threading
 import time
+import traceback
 import warnings
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -200,42 +200,44 @@ def _setup_logging(verbose: bool) -> logging.Logger:
     console_handler.setFormatter(formatter)
     console_handler.addFilter(_ConsoleFilter())
 
-    file_handler = TimedRotatingFileHandler(
-        log_path,
-        when="midnight",
-        backupCount=retention_days,
-        encoding="utf-8",
-        delay=True,
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    file_handler.suffix = "%Y-%m-%d"
-
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
 
     logging.captureWarnings(True)
     warnings.simplefilter("default")
 
-    if not isinstance(sys.stdout, _StreamTee):
-        sys.stdout = _StreamTee(_ORIGINAL_STDOUT, logger, logging.INFO, file_only=True)
-    if not isinstance(sys.stderr, _StreamTee):
-        sys.stderr = _StreamTee(_ORIGINAL_STDERR, logger, logging.ERROR, file_only=True)
+    # Leave stdout/stderr untouched; file logging is handled only on fatal errors.
 
     _cleanup_old_logs(log_dir, file_prefix, retention_days, verbose=verbose)
 
     if verbose:
         print(
-            "[trade] Logging to console and daily file | "
-            f"path={log_path} retention_days={retention_days} level={logging.getLevelName(console_level)}"
+            "[trade] Logging to console (error log only on fatal) | "
+            f"error_log={log_path} retention_days={retention_days} level={logging.getLevelName(console_level)}"
         )
         if logging_error:
             print(f"[trade] Logging config warning: {logging_error}")
 
     return logger
+
+
+def _write_fatal_error(exc: BaseException) -> None:
+    logging_cfg, _ = _load_logging_config(CONFIG_PATH)
+    log_dir = Path(logging_cfg.get("dir", DEFAULT_LOG_DIR))
+    file_prefix = str(logging_cfg.get("file_prefix", DEFAULT_LOG_FILE_PREFIX)).strip() or DEFAULT_LOG_FILE_PREFIX
+    log_path = log_dir / f"{file_prefix}.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(tz=INDIA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+        message = f"{timestamp} | ERROR | Fatal error: {exc}\n{trace}\n"
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write(message)
+    except OSError as write_exc:
+        target_stderr = _ORIGINAL_STDERR or sys.stderr
+        print(f"[trade] Failed to write fatal error log: {write_exc}", file=target_stderr)
 
 
 def _ist_iso_from_any(value: Optional[Any]) -> Optional[str]:
@@ -1406,6 +1408,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[trade] Fatal error: {exc}", file=sys.stderr)
+        _write_fatal_error(exc)
         return 1
     return 0
 

@@ -107,7 +107,7 @@
   "logging": {
     "dir": "logs",
     "file_prefix": "trade",
-    "retention_days": 5,
+    "retention_days": 1,
     "level": "INFO",
     "verbose_level": "DEBUG"
   },

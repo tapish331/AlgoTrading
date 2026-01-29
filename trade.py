@@ -883,6 +883,29 @@ def run(args: argparse.Namespace) -> None:
     if broker_sync_mutated:
         _persist_active_trades_state(ACTIVE_TRADES_PATH, active_trades, verbose=args.verbose)
 
+    # --- Intraday-only guard: clear carried state (broker already auto-squares off) ---
+    today_ist = datetime.now(INDIA_TZ).date()
+
+    removed = []
+    for ticker, trade in list(active_trades.items()):
+        try:
+            dt = datetime.fromisoformat(trade.entry_time)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=INDIA_TZ)
+            if dt.astimezone(INDIA_TZ).date() != today_ist:
+                removed.append(ticker)
+                del active_trades[ticker]
+        except Exception:
+            # If entry_time is malformed, drop it rather than risking carry-over
+            removed.append(ticker)
+            del active_trades[ticker]
+
+    if removed:
+        if args.verbose:
+            print(f"[trade] Startup intraday guard: cleared stale active_trades: {sorted(removed)}")
+        _persist_active_trades_state(ACTIVE_TRADES_PATH, active_trades, verbose=args.verbose)
+    # --- end intraday-only guard ---
+
     trade_status_indices: Dict[str, int] = {ticker: flat_status_idx for ticker in tickers}
     for ticker, trade in active_trades.items():
         if trade.direction == status_long_label:

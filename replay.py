@@ -820,7 +820,7 @@ def _generate_replay_memory(
     history, missing_history = load_all_history(tickers, timeframes)
 
     available_tickers = [ticker for ticker in tickers if ticker in history[decision_interval]]
-    if missing_history:
+    if missing_history and verbose:
         for ticker in sorted(missing_history):
             frames = ", ".join(sorted(missing_history[ticker]))
             print(
@@ -942,7 +942,7 @@ def _generate_replay_memory(
     realized_pct_sum = 0.0
     realized_pct_sq_sum = 0.0
     realized_pct_count = 0
-    # sign distribution of realized trade PnL (evaluation only)
+    # sign distribution of realized trade PnL
     realized_pct_pos_count = 0
     realized_pct_neg_count = 0
     realized_pct_zero_count = 0
@@ -961,10 +961,7 @@ def _generate_replay_memory(
     def _record_realized_pct(pct_value: float) -> None:
         nonlocal realized_pct_sum, realized_pct_sq_sum, realized_pct_count
         nonlocal realized_pct_pos_count, realized_pct_neg_count, realized_pct_zero_count
-        if mode != "evaluation":
-            return
-
-        # Track sum and sum of squares for evaluation-only PnL t-statistics.
+        # Track sum and sum of squares for realized PnL statistics.
         realized_pct_sum += pct_value
         realized_pct_sq_sum += pct_value * pct_value
         realized_pct_count += 1
@@ -1501,7 +1498,7 @@ def _generate_replay_memory(
     total_pct_pnl = None
     std_pct_pnl = None
     pnl_tstat = None
-    if mode == "evaluation" and realized_pct_count:
+    if realized_pct_count:
         total_pct_pnl = realized_pct_sum
         avg_pct_pnl = realized_pct_sum / realized_pct_count
         if realized_pct_count >= 2:
@@ -1509,16 +1506,17 @@ def _generate_replay_memory(
             variance = (realized_pct_sq_sum - realized_pct_count * mean * mean) / (realized_pct_count - 1)
             variance = max(variance, 0.0)
             std_pct_pnl = math.sqrt(variance)
-            if std_pct_pnl == 0.0:
-                if mean > 0:
-                    pnl_tstat = float("inf")
-                elif mean < 0:
-                    pnl_tstat = float("-inf")
+            if mode == "evaluation":
+                if std_pct_pnl == 0.0:
+                    if mean > 0:
+                        pnl_tstat = float("inf")
+                    elif mean < 0:
+                        pnl_tstat = float("-inf")
+                    else:
+                        pnl_tstat = 0.0
                 else:
-                    pnl_tstat = 0.0
-            else:
-                pnl_tstat = mean / (std_pct_pnl / math.sqrt(realized_pct_count))
-        else:
+                    pnl_tstat = mean / (std_pct_pnl / math.sqrt(realized_pct_count))
+        elif mode == "evaluation":
             pnl_tstat = 0.0
     if verbose:
         if selected_timestamps:

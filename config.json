@@ -76,7 +76,7 @@
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
   "training_trailing_stop_loss_pct": 1.0,
-  "evaluation_trailing_stop_loss_pct": 0.0075,
+  "evaluation_trailing_stop_loss_pct": 0.01,
   "training_take_profit_pct": 1.0,
   "evaluation_take_profit_pct": 0.005,
   "tuning": {

@@ -16,11 +16,11 @@ DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.0
 DEFAULT_METRIC = "pnl_tstat"
 
 
-def _write_config(config: Dict[str, Any], path: Path, verbose: bool) -> None:
+def _write_config(config: Dict[str, Any], path: Path, verbose: bool, quiet: bool) -> None:
     """Persist the provided configuration to disk."""
     serialized = json.dumps(config, indent=2)
     path.write_text(serialized + "\n", encoding="utf-8")
-    if verbose:
+    if verbose and not quiet:
         ts_val = config.get("evaluation_trailing_stop_loss_pct")
         tp_val = config.get("evaluation_take_profit_pct")
         trailing_stop = f"{float(ts_val):.4f}" if isinstance(ts_val, (float, int)) else "n/a"
@@ -87,6 +87,7 @@ def tune_take_profit_and_trailing_stop_loss(
     take_profit_candidates: List[float],
     metric: str,
     verbose: bool,
+    quiet: bool = False,
 ) -> Tuple[Tuple[float, float], Dict[str, Any]]:
     if not trailing_candidates:
         raise ValueError("No trailing stop candidates provided for tuning.")
@@ -107,7 +108,7 @@ def tune_take_profit_and_trailing_stop_loss(
     results: List[Tuple[float, float, float]] = []
     total = len(trailing_candidates) * len(take_profit_candidates)
 
-    if verbose:
+    if verbose and not quiet:
         trailing_joined = ", ".join(f"{c:.4f}" for c in trailing_candidates)
         take_profit_joined = ", ".join(f"{c:.4f}" for c in take_profit_candidates)
         print(f"[tune] Evaluating {total} combinations using metric '{metric}'")
@@ -120,7 +121,7 @@ def tune_take_profit_and_trailing_stop_loss(
             product(trailing_candidates, take_profit_candidates),
             start=1,
         ):
-            if verbose:
+            if verbose and not quiet:
                 print(
                     f"[tune] ({idx}/{total}) Running evaluation with "
                     f"trailing_stop={trailing_stop:.4f}, take_profit={take_profit:.4f}"
@@ -134,7 +135,7 @@ def tune_take_profit_and_trailing_stop_loss(
             score = _score_summary(summary, metric)
             results.append((trailing_stop, take_profit, score))
 
-            if verbose:
+            if verbose and not quiet:
                 pnl = summary.get("avg_pct_pnl")
                 pnl_str = f"{pnl:.4f}%" if isinstance(pnl, (float, int)) and pnl is not None else "n/a"
                 print(
@@ -155,9 +156,9 @@ def tune_take_profit_and_trailing_stop_loss(
     final_config = copy.deepcopy(original_config)
     final_config["evaluation_trailing_stop_loss_pct"] = best_pair[0]
     final_config["evaluation_take_profit_pct"] = best_pair[1]
-    _write_config(final_config, CONFIG_PATH, verbose=verbose)
+    _write_config(final_config, CONFIG_PATH, verbose=verbose, quiet=quiet)
 
-    if verbose:
+    if verbose and not quiet:
         print(
             f"[tune] Best pair trailing_stop={best_pair[0]:.4f}, take_profit={best_pair[1]:.4f} "
             f"with {metric}={best_score:.4f}; config updated at {CONFIG_PATH}"
@@ -173,7 +174,7 @@ def tune_take_profit_and_trailing_stop_loss(
             print(
                 f"  trailing_stop={trailing_stop:.4f}, take_profit={take_profit:.4f}: {score:.4f} {marker}"
             )
-    else:
+    elif not quiet:
         print(
             f"Updated evaluation_trailing_stop_loss_pct to {best_pair[0]:.4f} and "
             f"evaluation_take_profit_pct to {best_pair[1]:.4f} (metric '{metric}'={best_score:.4f})"

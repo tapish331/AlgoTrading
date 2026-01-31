@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import hashlib
 import json
 import shutil
@@ -38,6 +39,34 @@ WINNER_CHECKPOINT = CHECKPOINT_DIR / "light_rainbow_winner.pt"
 META_PATH = CHECKPOINT_DIR / "winner_meta.json"
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE_PREFIX = "train"
+
+
+def _fmt_pct(value: Any) -> str:
+    if value is None:
+        return "na"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "na"
+    if not math.isfinite(num):
+        return "na"
+    return f"{num:.4f}%"
+
+
+def _fmt_int(value: Any) -> str:
+    if value is None:
+        return "na"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "na"
+    if not math.isfinite(num):
+        return "na"
+    return str(int(num))
+
+
+def _fmt_triplet(avg_pct: Any, total: Any, positive: Any) -> str:
+    return f"{_fmt_pct(avg_pct)}/{_fmt_int(total)}/+{_fmt_int(positive)}"
 
 
 def _load_logging_config(path: Path) -> Dict[str, Any]:
@@ -120,6 +149,7 @@ def _run_pair_tuning(verbose: bool) -> None:
             take_profit_candidates,
             metric,
             verbose=verbose,
+            quiet=not verbose,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[train] Take profit + trailing stop tuning failed: {exc}")
@@ -136,6 +166,7 @@ def _promote_checkpoint(
     total_pct_pnl: Optional[float] = None,
     std_pct_pnl: Optional[float] = None,
     completed_trades: Optional[int] = None,
+    positive_trades: Optional[int] = None,
     promotion_metric: Optional[str] = None,
     verbose: bool = False,
 ) -> None:
@@ -152,6 +183,7 @@ def _promote_checkpoint(
             "total_pct_pnl": total_pct_pnl,
             "std_pct_pnl": std_pct_pnl,
             "completed_trades": completed_trades,
+            "positive_trades": positive_trades,
             "avg_reward": eval_reward,
             "winner_checkpoint": str(winner_ckpt),
             "source_checkpoint": str(current_ckpt),
@@ -201,13 +233,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+    iteration = 0
 
     try:
         while True:
+            iteration += 1
+            loop_start = time.perf_counter()
             config = _load_config()
             train_cfg = config.get("train", {})
             train_mode = str(train_cfg.get("mode", "RL")).upper()
-            print(f"[train] Using train.mode={train_mode}")
+            if args.verbose:
+                print(f"[train] Using train.mode={train_mode}")
             promotion_metric = str(train_cfg.get("promotion_metric", "pnl_tstat")).lower()
             fallback_metric = str(train_cfg.get("promotion_fallback_metric", "avg_pct_pnl")).lower()
             allowed_metrics = {"pnl_tstat", "avg_pct_pnl", "avg_reward"}
@@ -226,6 +262,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             winner_path = WINNER_CHECKPOINT
 
             training_summary = populate_training_replay_memory(verbose=args.verbose)
+            training_avg_pct_pnl = training_summary.get("avg_pct_pnl")
+            training_trades = training_summary.get("completed_trades", 0)
+            training_pos_trades = training_summary.get("positive_trades", 0)
             train_args = SimpleNamespace(
                 verbose=args.verbose,
                 replay_path=str(training_summary["path"]),
@@ -241,6 +280,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             current_std_pct_pnl = eval_summary.get("std_pct_pnl")
             current_pnl_tstat = eval_summary.get("pnl_tstat")
             current_trades = int(eval_summary.get("completed_trades", 0) or 0)
+            current_pos_trades = int(eval_summary.get("positive_trades", 0) or 0)
             metric_values = {
                 "pnl_tstat": current_pnl_tstat,
                 "avg_pct_pnl": current_avg_pct_pnl,
@@ -259,6 +299,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             meta = _load_meta()
             winner_avg_reward = meta.get("avg_reward") if meta else None
+            winner_avg_pct_pnl = None
+            winner_trades = None
+            winner_pos_trades = None
             winner_promotion_score = None
             if meta:
                 winner_promotion_score = meta.get("promotion_score")
@@ -268,20 +311,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                     winner_promotion_score = meta.get("pnl_per_trade")
                 if winner_promotion_score is None:
                     winner_promotion_score = meta.get("avg_pct_pnl")
+                winner_avg_pct_pnl = meta.get("avg_pct_pnl")
+                if winner_avg_pct_pnl is None:
+                    winner_avg_pct_pnl = meta.get("pnl_per_trade")
+                winner_trades = meta.get("completed_trades")
+                winner_pos_trades = meta.get("positive_trades")
             changed = bool(meta and dataset_sig and dataset_sig != meta.get("dataset_signature"))
-            print(
-                "[train] Promotion check | "
-                f"promotion_score={(promotion_score if promotion_score is not None else float('nan')):.4f} "
-                f"({promotion_metric_used}) | "
-                f"winner_score={(winner_promotion_score if winner_promotion_score is not None else float('nan')):.4f} | "
-                f"pnl_tstat={(current_pnl_tstat if current_pnl_tstat is not None else float('nan')):.4f} | "
-                f"avg_pct_pnl={(current_avg_pct_pnl if current_avg_pct_pnl is not None else float('nan')):.4f}% | "
-                f"trades={current_trades} | "
-                f"avg_reward={current_avg_reward:.4f} | "
-                f"winner_avg_reward={(winner_avg_reward if winner_avg_reward is not None else float('nan')):.4f} | "
-                f"dataset_changed={changed} | ckpt={current_ckpt.name}"
-            )
             if args.verbose:
+                print(
+                    "[train] Promotion check | "
+                    f"promotion_score={(promotion_score if promotion_score is not None else float('nan')):.4f} "
+                    f"({promotion_metric_used}) | "
+                    f"winner_score={(winner_promotion_score if winner_promotion_score is not None else float('nan')):.4f} | "
+                    f"pnl_tstat={(current_pnl_tstat if current_pnl_tstat is not None else float('nan')):.4f} | "
+                    f"avg_pct_pnl={(current_avg_pct_pnl if current_avg_pct_pnl is not None else float('nan')):.4f}% | "
+                    f"trades={current_trades} | "
+                    f"avg_reward={current_avg_reward:.4f} | "
+                    f"winner_avg_reward={(winner_avg_reward if winner_avg_reward is not None else float('nan')):.4f} | "
+                    f"dataset_changed={changed} | ckpt={current_ckpt.name}"
+                )
                 avg_pct_label = (
                     f"{current_avg_pct_pnl:.4f}%" if isinstance(current_avg_pct_pnl, (float, int)) else "n/a"
                 )
@@ -304,10 +352,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"promotion_score={promotion_score_label} ({promotion_metric_used})"
                 )
 
-            if not current_ckpt.exists():
-                print(f"[train] Warning: checkpoint {current_ckpt} missing; skipping promotion check.")
+            can_promote = current_ckpt.exists()
+            should_promote = can_promote and _should_promote(meta, dataset_sig, promotion_score)
+            if not can_promote:
+                if args.verbose:
+                    print(f"[train] Warning: checkpoint {current_ckpt} missing; skipping promotion check.")
             else:
-                if _should_promote(meta, dataset_sig, promotion_score):
+                if should_promote:
                     _promote_checkpoint(
                         current_ckpt=current_ckpt,
                         winner_ckpt=winner_path,
@@ -319,12 +370,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                         total_pct_pnl=current_total_pct_pnl,
                         std_pct_pnl=current_std_pct_pnl,
                         completed_trades=current_trades,
+                        positive_trades=current_pos_trades,
                         promotion_metric=promotion_metric_used,
                         verbose=args.verbose,
                     )
                     _run_pair_tuning(verbose=args.verbose)
                 elif args.verbose:
                     print("[train] Existing winner checkpoint still better; no promotion.")
+
+            if not args.verbose:
+                loop_runtime = time.perf_counter() - loop_start
+                print(
+                    f"i={iteration} "
+                    f"tr={_fmt_triplet(training_avg_pct_pnl, training_trades, training_pos_trades)} "
+                    f"ev={_fmt_triplet(current_avg_pct_pnl, current_trades, current_pos_trades)} "
+                    f"win={_fmt_triplet(winner_avg_pct_pnl, winner_trades, winner_pos_trades)} "
+                    f"p={'Y' if should_promote else 'N'} rt={loop_runtime:.2f}s"
+                )
 
             time.sleep(max(args.sleep, 0.1))
     except KeyboardInterrupt:

@@ -68,6 +68,10 @@
     "buy",
     "sell"
   ],
+  "reward": {
+    "rl": "proximity_cubic_range",
+    "sl": "proximity_cubic_range"
+  },
   "training_days_num": 25,
   "evaluation_days_num": 5,
   "training_entry_confirm_window": 3,
@@ -113,6 +117,7 @@
     "level": "INFO",
     "verbose_level": "DEBUG"
   },
+  "torch_device": "auto",
   "trade_status": [
     "flat",
     "long",

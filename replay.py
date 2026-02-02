@@ -38,6 +38,9 @@ MODEL_ACTIONS = ["hold", "buy", "sell"]
 
 _HISTORY_CACHE: Dict[Path, Tuple[int, int, pd.DataFrame]] = {}
 
+SUPPORTED_RL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range"}
+SUPPORTED_SL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range"}
+
 ZERODHA_BROKERAGE_PCT = 0.0003  # 0.03%
 ZERODHA_BROKERAGE_CAP = 20.0  # Rs per executed order
 ZERODHA_STT_PCT = 0.00025  # 0.025% on sell side
@@ -85,6 +88,26 @@ def ensure_torch_available() -> None:
         )
 
 
+def _resolve_torch_device(config: Dict[str, Any], verbose: bool = False, component: str = "replay") -> torch.device:
+    ensure_torch_available()
+    pref = str(config.get("torch_device", "auto")).strip().lower()
+    cuda_available = torch.cuda.is_available()
+    if pref in ("cuda", "gpu"):
+        if cuda_available:
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+            if verbose:
+                print(f"[{component}] torch_device=cuda requested but CUDA is unavailable; falling back to CPU")
+    elif pref == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if cuda_available else "cpu")
+    if verbose:
+        print(f"[{component}] torch_device={pref} resolved={device}")
+    return device
+
+
 def _usage_snapshot() -> Optional[Dict[str, float]]:
     if resource is not None:
         try:
@@ -127,7 +150,7 @@ def build_model(
     if ckpt_path.exists():
         if verbose:
             print(f"[replay] Loading checkpoint from {ckpt_path}")
-        state_dict = torch.load(ckpt_path, map_location=torch.device("cpu"))
+        state_dict = torch.load(ckpt_path, map_location=torch.device("cpu"), weights_only=True)
         model.load_state_dict(state_dict)
     elif verbose:
         print(f"[replay] No checkpoint found at {ckpt_path}; starting with fresh weights")
@@ -224,6 +247,14 @@ def compute_day_positions(df: pd.DataFrame) -> Dict[pd.Timestamp, Tuple[int, int
         for idx, ts in enumerate(group_sorted["date"]):
             positions[ts] = (idx, total)
     return positions
+
+
+def _normalize_reward_name(value: Any, *, role: str, allowed: Iterable[str]) -> str:
+    name = str(value or "").strip().lower()
+    if name not in allowed:
+        allowed_list = ", ".join(sorted(set(allowed)))
+        raise ValueError(f"Unsupported reward.{role} '{value}'. Expected one of: {allowed_list}")
+    return name
 
 
 # --- Proximity-based reward helpers ---
@@ -411,13 +442,18 @@ def infer_actions(
 ) -> Dict[str, Dict[str, Any]]:
     tickers = list(features.keys())
     matrix = np.stack([features[t] for t in tickers], axis=0).astype(np.float32)
-    tensor = torch.from_numpy(matrix)
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    tensor = torch.from_numpy(matrix).to(device)
     with torch.no_grad():
         q_distribution = model(tensor)
         q_vals = q_distribution.mean(dim=2)
+        q_vals_cpu = q_vals.detach().cpu().numpy()
     results: Dict[str, Dict[str, Any]] = {}
     for idx, ticker in enumerate(tickers):
-        ticker_q = q_vals[idx].cpu().numpy()
+        ticker_q = q_vals_cpu[idx]
         action_idx = int(np.argmax(ticker_q))
         default_label = MODEL_ACTIONS[action_idx] if 0 <= action_idx < len(MODEL_ACTIONS) else str(action_idx)
         action_label = label_lookup.get(action_idx, default_label)
@@ -610,6 +646,155 @@ def _fill_reward_snapshot_from_P(
         pnl_snapshot[ticker] = base_reward * range_factor
 
 
+def _fill_reward_snapshot_from_pnl_delta(
+    *,
+    pnl_snapshot: Dict[str, float],
+    ticker_features: Dict[str, np.ndarray],
+    prices: Dict[str, float],
+    active_trades: Dict[str, Trade],
+    percent_pnl_snapshot: Dict[str, float],
+    prev_unrealized_pct: Dict[str, float],
+    cost_exchange: str,
+    status_long_label: str,
+) -> None:
+    """
+    Dense RL reward:
+      reward[t] = net_pct_pnl(t) - net_pct_pnl(t-1)
+
+    - While in a trade: net_pct_pnl is mark-to-market using current price.
+    - On exit candles: net_pct_pnl uses the realized value already stored in percent_pnl_snapshot.
+    - When flat: net_pct_pnl is 0.
+    """
+    for ticker in ticker_features.keys():
+        prev = float(prev_unrealized_pct.get(ticker, 0.0))
+
+        # If we exited this candle, percent_pnl_snapshot already holds the realized (net-of-costs) %PnL.
+        if ticker in percent_pnl_snapshot:
+            current = float(percent_pnl_snapshot[ticker])
+            pnl_snapshot[ticker] = current - prev
+            prev_unrealized_pct[ticker] = 0.0
+            continue
+
+        trade = active_trades.get(ticker)
+        if trade is None:
+            pnl_snapshot[ticker] = 0.0
+            prev_unrealized_pct[ticker] = 0.0
+            continue
+
+        price = float(prices.get(ticker, trade.entry_price))
+        is_long = (trade.direction == status_long_label)
+        current = compute_net_percent_pnl(
+            is_long,
+            trade.entry_price,
+            price,
+            trade.quantity,
+            cost_exchange,
+        )
+        pnl_snapshot[ticker] = current - prev
+        prev_unrealized_pct[ticker] = current
+
+
+def _fill_reward_snapshot(
+    reward_fn: str,
+    *,
+    ts: pd.Timestamp,
+    pnl_snapshot: Dict[str, float],
+    ticker_features: Dict[str, np.ndarray],
+    inference_results: Dict[str, Dict[str, Any]],
+    executed_events: List[Dict[str, Any]],
+    status_before: Dict[str, int],
+    P_lookup: Dict[str, Dict[pd.Timestamp, float]],
+    range_lookup: Dict[str, Dict[pd.Timestamp, float]],
+    flat_status_idx: int,
+    long_status_idx: int,
+    short_status_idx: int,
+    prices: Dict[str, float],
+    active_trades: Dict[str, Trade],
+    percent_pnl_snapshot: Dict[str, float],
+    prev_unrealized_pct: Dict[str, float],
+    cost_exchange: str,
+    status_long_label: str,
+) -> None:
+    if reward_fn == "proximity_cubic_range":
+        _fill_reward_snapshot_from_P(
+            ts,
+            pnl_snapshot,
+            ticker_features,
+            inference_results,
+            executed_events,
+            status_before,
+            P_lookup,
+            range_lookup,
+            flat_status_idx,
+            long_status_idx,
+            short_status_idx,
+        )
+        return
+    if reward_fn == "net_pct_pnl_delta":
+        _fill_reward_snapshot_from_pnl_delta(
+            pnl_snapshot=pnl_snapshot,
+            ticker_features=ticker_features,
+            prices=prices,
+            active_trades=active_trades,
+            percent_pnl_snapshot=percent_pnl_snapshot,
+            prev_unrealized_pct=prev_unrealized_pct,
+            cost_exchange=cost_exchange,
+            status_long_label=status_long_label,
+        )
+        return
+    raise ValueError(f"Unsupported reward.rl '{reward_fn}'. Expected one of: {sorted(SUPPORTED_RL_REWARDS)}")
+
+
+def _supervised_reward_vector_from_proximity(
+    *,
+    P_val: float,
+    range_factor: float,
+    status_idx: int,
+    flat_status_idx: int,
+    long_status_idx: int,
+    short_status_idx: int,
+) -> List[float]:
+    rewards_by_action: List[float] = []
+    for action_name in MODEL_ACTIONS:
+        base = _reward_from_P(
+            P_val,
+            action_name,
+            status_idx,
+            flat_status_idx,
+            long_status_idx,
+            short_status_idx,
+        )
+        rewards_by_action.append(base * range_factor)
+    return rewards_by_action
+
+
+def _supervised_reward_vector_from_pnl_delta(
+    *,
+    status_label: str,
+    status_long_label: str,
+    status_short_label: str,
+    net_long: float,
+    net_short: float,
+    exit_long: float,
+    exit_short: float,
+    buy_idx: int,
+    sell_idx: int,
+    hold_idx: int,
+) -> List[float]:
+    rewards_by_action = [0.0] * len(MODEL_ACTIONS)
+    status_lower = status_label.lower()
+    if status_lower == status_long_label.lower():
+        rewards_by_action[hold_idx] = net_long
+        rewards_by_action[sell_idx] = exit_long
+    elif status_lower == status_short_label.lower():
+        rewards_by_action[hold_idx] = net_short
+        rewards_by_action[buy_idx] = exit_short
+    else:
+        rewards_by_action[buy_idx] = net_long
+        rewards_by_action[sell_idx] = net_short
+    return rewards_by_action
+
+
 def _update_reward_stats_from_snapshot(
     pnl_snapshot: Dict[str, float],
     inference_results: Dict[str, Dict[str, Any]],
@@ -698,6 +883,17 @@ def _generate_replay_memory(
     fetch_cfg = config.get("fetch", {})
     train_cfg = config.get("train", {})
     ml_cfg = config.get("ml_rl", {})
+    reward_cfg = config.get("reward", {})
+    rl_reward_fn = _normalize_reward_name(
+        reward_cfg.get("rl", "net_pct_pnl_delta"),
+        role="rl",
+        allowed=SUPPORTED_RL_REWARDS,
+    )
+    sl_reward_fn = _normalize_reward_name(
+        reward_cfg.get("sl", "proximity_cubic_range"),
+        role="sl",
+        allowed=SUPPORTED_SL_REWARDS,
+    )
     train_mode = str(train_cfg.get("mode", "RL")).upper()
     if train_mode not in ("RL", "SL"):
         raise ValueError("train.mode must be either 'RL' or 'SL'")
@@ -780,7 +976,10 @@ def _generate_replay_memory(
         )
     model = None
     if not use_supervised:
+        device = _resolve_torch_device(config, verbose=verbose, component=f"replay:{mode}")
         model = build_model(input_dim, hidden_layers, checkpoint_dir, verbose=verbose)
+        model.to(device)
+        model.eval()
         if verbose:
             ckpt_name = f"light_rainbow_{input_dim}_{hidden_layers}.pt"
             print(
@@ -800,16 +999,17 @@ def _generate_replay_memory(
                 )
             )
             print(
-                "[config:reward] reward_fn=proximity_cubic | "
+                f"[config:reward] reward_fn={rl_reward_fn} | "
                 f"trailing_stop={trailing_stop:.4f} | "
                 f"take_profit={take_profit:.4f} | "
                 f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
-                f"shorting_allowed={'short' in trade_status_list}"
+                f"shorting_allowed={'short' in trade_status_list} | "
+                f"cost_exchange={cost_exchange}"
             )
     elif verbose:
         print(
             f"[replay:{mode}] Supervised mode enabled (SL); "
-            "skipping model load for training replay generation."
+            f"reward_fn={sl_reward_fn}; skipping model load for training replay generation."
         )
 
     if decision_interval not in timeframes:
@@ -1000,16 +1200,64 @@ def _generate_replay_memory(
         )
         reward_trace_n += 1
 
-    for ts in selected_timestamps:
+    # Tracks the last "net %PnL (mark-to-market)" per ticker so reward can be a delta.
+    prev_unrealized_pct: Dict[str, float] = {}
+
+    for ts_idx, ts in enumerate(selected_timestamps):
         local_time = get_time_component(ts)
         if local_time < safe_start_time:
             continue
+        next_ts = selected_timestamps[ts_idx + 1] if (ts_idx + 1) < len(selected_timestamps) else None
         if use_supervised and mode == "training":
             for ticker in tickers:
-                P_val = float(P_lookup.get(ticker, {}).get(ts, 0.0))
-                range_factor = float(range_factor_lookup.get(ticker, {}).get(ts, 0.0))
-                if range_factor == 0.0 and P_val == 0.0:
-                    continue
+                P_val = 0.0
+                range_factor = 0.0
+                if sl_reward_fn == "proximity_cubic_range":
+                    P_val = float(P_lookup.get(ticker, {}).get(ts, 0.0))
+                    range_factor = float(range_factor_lookup.get(ticker, {}).get(ts, 0.0))
+                    if range_factor == 0.0 and P_val == 0.0:
+                        continue
+                    net_long = net_short = exit_long = exit_short = 0.0
+                else:
+                    if next_ts is None:
+                        continue
+                    price_now = price_ix[ticker].get(ts)
+                    price_next = price_ix[ticker].get(next_ts)
+                    if not (pd.notna(price_now) and pd.notna(price_next)):
+                        continue
+                    price_now_f = float(price_now)
+                    price_next_f = float(price_next)
+                    qty = compute_quantity(capital_per_ticker, leverage, price_now_f)
+                    if qty <= 0:
+                        continue
+                    net_long = compute_net_percent_pnl(
+                        True,
+                        price_now_f,
+                        price_next_f,
+                        qty,
+                        cost_exchange,
+                    )
+                    net_short = compute_net_percent_pnl(
+                        False,
+                        price_now_f,
+                        price_next_f,
+                        qty,
+                        cost_exchange,
+                    )
+                    exit_long = compute_net_percent_pnl(
+                        True,
+                        price_now_f,
+                        price_now_f,
+                        qty,
+                        cost_exchange,
+                    )
+                    exit_short = compute_net_percent_pnl(
+                        False,
+                        price_now_f,
+                        price_now_f,
+                        qty,
+                        cost_exchange,
+                    )
                 for status_idx, status_label in enumerate(trade_status_list):
                     feats = build_feature_vector(
                         ticker,
@@ -1023,17 +1271,28 @@ def _generate_replay_memory(
                     )
                     if feats is None or len(feats) != input_dim:
                         continue
-                    rewards_by_action: List[float] = []
-                    for action_name in MODEL_ACTIONS:
-                        base = _reward_from_P(
-                            P_val,
-                            action_name,
-                            status_idx,
-                            flat_status_idx,
-                            long_status_idx,
-                            short_status_idx,
+                    if sl_reward_fn == "proximity_cubic_range":
+                        rewards_by_action = _supervised_reward_vector_from_proximity(
+                            P_val=P_val,
+                            range_factor=range_factor,
+                            status_idx=status_idx,
+                            flat_status_idx=flat_status_idx,
+                            long_status_idx=long_status_idx,
+                            short_status_idx=short_status_idx,
                         )
-                        rewards_by_action.append(base * range_factor)
+                    else:
+                        rewards_by_action = _supervised_reward_vector_from_pnl_delta(
+                            status_label=status_label,
+                            status_long_label=status_long_label,
+                            status_short_label=status_short_label,
+                            net_long=net_long,
+                            net_short=net_short,
+                            exit_long=exit_long,
+                            exit_short=exit_short,
+                            buy_idx=buy_idx,
+                            sell_idx=sell_idx,
+                            hold_idx=hold_idx,
+                        )
                     if status_label.lower() == status_long_label.lower():
                         rewards_by_action[buy_idx] = 0.0
                     elif status_label.lower() == status_short_label.lower():
@@ -1074,9 +1333,9 @@ def _generate_replay_memory(
                 print(f"[replay:{mode}] Supervised samples generated: {total_processed}")
             continue
 
-        status_before = dict(trade_status_indices)
         pnl_snapshot: Dict[str, float] = {ticker: 0.0 for ticker in tickers}
-        percent_pnl_snapshot: Dict[str, float] = {ticker: 0.0 for ticker in tickers}
+        # Only populate realized PnL on exit so pnl_delta can detect exit candles.
+        percent_pnl_snapshot: Dict[str, float] = {}
         ticker_features: Dict[str, np.ndarray] = {}
         prices: Dict[str, float] = {}
 
@@ -1223,18 +1482,25 @@ def _generate_replay_memory(
                 trade_status_indices[ticker] = flat_status_idx
                 del active_trades[ticker]
 
-            _fill_reward_snapshot_from_P(
-                ts,
-                pnl_snapshot,
-                ticker_features,
-                inference_results,
-                executed_events,
-                status_before,
-                P_lookup,
-                range_factor_lookup,
-                flat_status_idx,
-                long_status_idx,
-                short_status_idx,
+            _fill_reward_snapshot(
+                rl_reward_fn,
+                ts=ts,
+                pnl_snapshot=pnl_snapshot,
+                ticker_features=ticker_features,
+                inference_results=inference_results,
+                executed_events=executed_events,
+                status_before=trade_status_indices,
+                P_lookup=P_lookup,
+                range_lookup=range_factor_lookup,
+                flat_status_idx=flat_status_idx,
+                long_status_idx=long_status_idx,
+                short_status_idx=short_status_idx,
+                prices=prices,
+                active_trades=active_trades,
+                percent_pnl_snapshot=percent_pnl_snapshot,
+                prev_unrealized_pct=prev_unrealized_pct,
+                cost_exchange=cost_exchange,
+                status_long_label=status_long_label,
             )
             _update_reward_stats_from_snapshot(
                 pnl_snapshot,
@@ -1426,18 +1692,25 @@ def _generate_replay_memory(
             elif entry_action == sell_label:
                 entry_short += 1
 
-        _fill_reward_snapshot_from_P(
-            ts,
-            pnl_snapshot,
-            ticker_features,
-            inference_results,
-            executed_events,
-            status_before,
-            P_lookup,
-            range_factor_lookup,
-            flat_status_idx,
-            long_status_idx,
-            short_status_idx,
+        _fill_reward_snapshot(
+            rl_reward_fn,
+            ts=ts,
+            pnl_snapshot=pnl_snapshot,
+            ticker_features=ticker_features,
+            inference_results=inference_results,
+            executed_events=executed_events,
+            status_before=trade_status_indices,
+            P_lookup=P_lookup,
+            range_lookup=range_factor_lookup,
+            flat_status_idx=flat_status_idx,
+            long_status_idx=long_status_idx,
+            short_status_idx=short_status_idx,
+            prices=prices,
+            active_trades=active_trades,
+            percent_pnl_snapshot=percent_pnl_snapshot,
+            prev_unrealized_pct=prev_unrealized_pct,
+            cost_exchange=cost_exchange,
+            status_long_label=status_long_label,
         )
         _update_reward_stats_from_snapshot(
             pnl_snapshot,

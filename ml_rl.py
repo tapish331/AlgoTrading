@@ -70,6 +70,31 @@ def _load_config() -> Dict[str, Any]:
         return json.load(handle)
 
 
+def _resolve_torch_device(config: Dict[str, Any], verbose: bool = False) -> torch.device:
+    if _TORCH_IMPORT_ERROR is not None or torch is None:
+        raise RuntimeError(
+            "PyTorch is required for training. Install dependencies via "
+            "`pip install -r requirements.txt`. "
+            f"Original error: {_TORCH_IMPORT_ERROR}"
+        )
+    pref = str(config.get("torch_device", "auto")).strip().lower()
+    cuda_available = torch.cuda.is_available()
+    if pref in ("cuda", "gpu"):
+        if cuda_available:
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+            if verbose:
+                print("[ml_rl] torch_device=cuda requested but CUDA is unavailable; falling back to CPU")
+    elif pref == "cpu":
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda" if cuda_available else "cpu")
+    if verbose:
+        print(f"[ml_rl] torch_device={pref} resolved={device}")
+    return device
+
+
 def _usage_snapshot() -> Optional[Dict[str, float]]:
     if resource is not None:
         try:
@@ -399,6 +424,23 @@ class ReplayDataset(Dataset):
             dtype=torch.float32,
         )
 
+    @classmethod
+    def from_tensors(
+        cls,
+        features: Tensor,
+        actions: Tensor,
+        rewards: Tensor,
+        percent_pnls: Tensor,
+        reward_vectors: Tensor,
+    ) -> "ReplayDataset":
+        obj = cls.__new__(cls)
+        obj.features = features
+        obj.actions = actions
+        obj.rewards = rewards
+        obj.percent_pnls = percent_pnls
+        obj.reward_vectors = reward_vectors
+        return obj
+
     def __len__(self) -> int:
         return self.features.shape[0]
 
@@ -494,6 +536,37 @@ def _load_training_samples(
     return samples
 
 
+def _load_training_dataset_cached(
+    replay_path: Path,
+    input_dim: int,
+    verbose: bool = False,
+) -> ReplayDataset:
+    cache_path = replay_path.with_suffix(".pt")
+    if cache_path.exists() and cache_path.stat().st_mtime > replay_path.stat().st_mtime:
+        payload = torch.load(cache_path, map_location="cpu")
+        return ReplayDataset.from_tensors(
+            payload["features"],
+            payload["actions"],
+            payload["rewards"],
+            payload["percent_pnls"],
+            payload["reward_vectors"],
+        )
+
+    samples = _load_training_samples(replay_path, input_dim, verbose=verbose)
+    dataset = ReplayDataset(samples)
+    torch.save(
+        {
+            "features": dataset.features,
+            "actions": dataset.actions,
+            "rewards": dataset.rewards,
+            "percent_pnls": dataset.percent_pnls,
+            "reward_vectors": dataset.reward_vectors,
+        },
+        cache_path,
+    )
+    return dataset
+
+
 def run_light_rainbow(args: argparse.Namespace) -> None:
     if _TORCH_IMPORT_ERROR is not None:
         raise RuntimeError(
@@ -558,11 +631,10 @@ def train_agent(args: argparse.Namespace) -> None:
     epochs = int(ml_cfg.get("epochs", 1))
 
     replay_path = Path(args.replay_path) if args.replay_path else TRAINING_REPLAY_PATH
-    samples = _load_training_samples(replay_path, input_dim, verbose=args.verbose)
-    if not samples:
+    dataset = _load_training_dataset_cached(replay_path, input_dim, verbose=args.verbose)
+    if len(dataset) == 0:
         raise ValueError(f"No usable training samples found in {replay_path}")
 
-    dataset = ReplayDataset(samples)
     if args.verbose:
         try:
             nonzero_pct = float((dataset.rewards != 0).float().mean().item() * 100.0)
@@ -637,10 +709,10 @@ def train_agent(args: argparse.Namespace) -> None:
     if checkpoint_path.exists():
         if args.verbose:
             print(f"[ml_rl] Loading checkpoint from {checkpoint_path}")
-        state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+        state_dict = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=True)
         model.load_state_dict(state_dict)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_torch_device(config, verbose=args.verbose)
     model.to(device)
     model.train()
 

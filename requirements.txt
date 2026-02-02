@@ -1,5 +1,5 @@
-# Use CPU-only PyTorch to avoid huge CUDA downloads on small servers.
---index-url https://download.pytorch.org/whl/cpu
+# Prefer CUDA-enabled PyTorch on Python < 3.13; fallback to CPU wheels on 3.13+.
+--index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.org/simple
 
 requests>=2.31.0
@@ -7,7 +7,9 @@ python-dotenv>=1.0.1
 kiteconnect>=4.2.0
 pandas>=2.1.0
 pyarrow>=12.0.0
-torch>=2.2.0
+# CUDA wheels (local version tag) rank lower than CPU wheels, so pin explicitly.
+torch==2.5.1+cu121 ; python_version < "3.13"
+torch>=2.10.0 ; python_version >= "3.13"
 numpy>=1.24.0
 jsonlines>=4.0.0
 psutil>=5.9.0
@@ -15,3 +17,4 @@ psutil>=5.9.0
 # pnl_tstat promotion scoring uses stdlib math; no extra packages required.
 # logging is handled via the stdlib (TimedRotatingFileHandler); no extra packages required.
 # entry confirm windows use stdlib collections.deque; no extra packages required.
+# RL replay reward now uses net %PnL deltas; no extra packages required.

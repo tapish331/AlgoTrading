@@ -540,7 +540,12 @@ def _load_training_dataset_cached(
     replay_path: Path,
     input_dim: int,
     verbose: bool = False,
+    cache_enabled: bool = True,
 ) -> ReplayDataset:
+    if not cache_enabled:
+        samples = _load_training_samples(replay_path, input_dim, verbose=verbose)
+        return ReplayDataset(samples)
+
     cache_path = replay_path.with_suffix(".pt")
     if cache_path.exists() and cache_path.stat().st_mtime > replay_path.stat().st_mtime:
         payload = torch.load(cache_path, map_location="cpu")
@@ -629,9 +634,15 @@ def train_agent(args: argparse.Namespace) -> None:
     learning_rate = float(ml_cfg.get("learning_rate", 1e-4))
     batch_size = int(ml_cfg.get("batch_size", 64))
     epochs = int(ml_cfg.get("epochs", 1))
+    cache_enabled = bool(ml_cfg.get("replay_cache_enabled", True))
 
     replay_path = Path(args.replay_path) if args.replay_path else TRAINING_REPLAY_PATH
-    dataset = _load_training_dataset_cached(replay_path, input_dim, verbose=args.verbose)
+    dataset = _load_training_dataset_cached(
+        replay_path,
+        input_dim,
+        verbose=args.verbose,
+        cache_enabled=cache_enabled,
+    )
     if len(dataset) == 0:
         raise ValueError(f"No usable training samples found in {replay_path}")
 

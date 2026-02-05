@@ -38,8 +38,8 @@ MODEL_ACTIONS = ["hold", "buy", "sell"]
 
 _HISTORY_CACHE: Dict[Path, Tuple[int, int, pd.DataFrame]] = {}
 
-SUPPORTED_RL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range"}
-SUPPORTED_SL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range"}
+SUPPORTED_RL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range", "trade_proximity_cubic_range"}
+SUPPORTED_SL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range", "trade_proximity_cubic_range"}
 
 ZERODHA_BROKERAGE_PCT = 0.0003  # 0.03%
 ZERODHA_BROKERAGE_CAP = 20.0  # Rs per executed order
@@ -66,6 +66,17 @@ class Trade:
     highest_price_time: Optional[str] = None
     lowest_price_time: Optional[str] = None
     data_timestamp: Optional[str] = None
+
+
+@dataclass
+class TradeRewardStep:
+    timestamp: pd.Timestamp
+    price: float
+    action_label: str
+    action_idx: int
+    trade_status_idx: int
+    features: Optional[np.ndarray] = None
+    replay_index: Optional[int] = None
 
 
 def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
@@ -302,6 +313,12 @@ def _build_daily_range_factor_lookup(decision_df: pd.DataFrame) -> Dict[pd.Times
         range_pct = np.where(day_low > 0.0, (day_high - day_low) / day_low * 100.0, 0.0)
 
     return {ts: float(rp) for ts, rp in zip(df["date"], range_pct)}
+
+
+def _range_factor_from_low_high(low: float, high: float) -> float:
+    if low <= 0.0 or high <= low:
+        return 0.0
+    return (high - low) / low * 100.0
 
 
 def _f(P: float) -> float:
@@ -898,6 +915,9 @@ def _generate_replay_memory(
     if train_mode not in ("RL", "SL"):
         raise ValueError("train.mode must be either 'RL' or 'SL'")
     use_supervised = mode == "training" and train_mode == "SL"
+    use_trade_proximity_rl = rl_reward_fn == "trade_proximity_cubic_range"
+    use_trade_proximity_sl = use_supervised and sl_reward_fn == "trade_proximity_cubic_range"
+    use_trade_proximity = use_trade_proximity_rl or use_trade_proximity_sl
 
     if not tickers:
         raise ValueError("No tickers configured in config.json")
@@ -975,7 +995,7 @@ def _generate_replay_memory(
             f"input_dim={input_dim}, hidden_layers={hidden_layers}, lookback={lookback}"
         )
     model = None
-    if not use_supervised:
+    if not use_supervised or use_trade_proximity_sl:
         device = _resolve_torch_device(config, verbose=verbose, component=f"replay:{mode}")
         model = build_model(input_dim, hidden_layers, checkpoint_dir, verbose=verbose)
         model.to(device)
@@ -1010,6 +1030,10 @@ def _generate_replay_memory(
         print(
             f"[replay:{mode}] Supervised mode enabled (SL); "
             f"reward_fn={sl_reward_fn}; skipping model load for training replay generation."
+        )
+    if use_trade_proximity_sl and verbose:
+        print(
+            f"[replay:{mode}] SL trade_proximity enabled; using model-driven trades to backfill reward vectors."
         )
 
     if decision_interval not in timeframes:
@@ -1200,15 +1224,173 @@ def _generate_replay_memory(
         )
         reward_trace_n += 1
 
+    def _finalize_trade_rewards(ticker: str, trade: Trade) -> None:
+        nonlocal reward_accum, min_reward, max_reward, negative_rewards
+        nonlocal total_processed, reward_events
+        steps = trade_reward_buffers.get(ticker, [])
+        if not steps:
+            return
+
+        trade_low = min(trade.lowest_price, trade.highest_price)
+        trade_high = max(trade.lowest_price, trade.highest_price)
+        range_factor = _range_factor_from_low_high(trade_low, trade_high)
+
+        for step in steps:
+            P_val = _proximity_P_for_day(step.price, trade_low, trade_high)
+            base_reward = _reward_from_P(
+                P_val,
+                step.action_label,
+                step.trade_status_idx,
+                flat_status_idx,
+                long_status_idx,
+                short_status_idx,
+            )
+            reward_val = base_reward * range_factor
+
+            if use_trade_proximity_rl:
+                if step.replay_index is not None and 0 <= step.replay_index < len(replay_memory):
+                    record = replay_memory[step.replay_index]
+                    pnl_map = record.get("pnl_pct")
+                    if isinstance(pnl_map, dict):
+                        pnl_map[ticker] = reward_val
+                    actions_map = record.get("ticker_actions", {})
+                    if isinstance(actions_map, dict) and ticker in actions_map:
+                        actions_map[ticker]["pnl_pct"] = reward_val
+                reward_accum += reward_val
+                min_reward = min(min_reward, reward_val)
+                max_reward = max(max_reward, reward_val)
+                if reward_val < 0:
+                    negative_rewards += 1
+                canonical = MODEL_ACTIONS[step.action_idx] if 0 <= step.action_idx < len(MODEL_ACTIONS) else None
+                if canonical:
+                    reward_sum_by_action[canonical] += reward_val
+                    reward_sq_by_action[canonical] += reward_val * reward_val
+                    if reward_val < 0:
+                        reward_neg_by_action[canonical] += 1
+
+            if use_trade_proximity_sl:
+                if step.features is None:
+                    continue
+                rewards_by_action = _supervised_reward_vector_from_proximity(
+                    P_val=P_val,
+                    range_factor=range_factor,
+                    status_idx=step.trade_status_idx,
+                    flat_status_idx=flat_status_idx,
+                    long_status_idx=long_status_idx,
+                    short_status_idx=short_status_idx,
+                )
+                status_label = trade_status_list[step.trade_status_idx]
+                if status_label.lower() == status_long_label.lower():
+                    rewards_by_action[buy_idx] = 0.0
+                elif status_label.lower() == status_short_label.lower():
+                    rewards_by_action[sell_idx] = 0.0
+                best_idx = int(max(range(len(MODEL_ACTIONS)), key=lambda i: rewards_by_action[i]))
+                best_label = model_to_config_label.get(best_idx, MODEL_ACTIONS[best_idx])
+                replay_memory.append(
+                    {
+                        "timestamp": step.timestamp.isoformat(),
+                        "ticker": ticker,
+                        "trade_status_idx": step.trade_status_idx,
+                        "trade_status": status_label,
+                        "features": step.features.tolist(),
+                        "reward_vector": rewards_by_action,
+                        "best_action_idx": best_idx,
+                        "best_action": best_label,
+                        "P": P_val,
+                        "range_factor": range_factor,
+                    }
+                )
+                total_processed += 1
+                reward_accum += rewards_by_action[best_idx]
+                reward_events += 1
+                for ai, canonical in enumerate(MODEL_ACTIONS):
+                    val = rewards_by_action[ai]
+                    reward_sum_by_action[canonical] += val
+                    reward_sq_by_action[canonical] += val * val
+                    reward_cnt_by_action[canonical] += 1
+                    if val < 0:
+                        reward_neg_by_action[canonical] += 1
+                if 0 <= best_idx < len(action_counts):
+                    action_counts[best_idx] += 1
+                min_reward = min(min_reward, min(rewards_by_action))
+                max_reward = max(max_reward, max(rewards_by_action))
+                if rewards_by_action[best_idx] < 0:
+                    negative_rewards += 1
+
+        trade_reward_buffers[ticker] = []
+
+    def _flush_open_trade_buffers_zero_reward() -> None:
+        if not use_trade_proximity_sl:
+            return
+        for ticker, steps in list(trade_reward_buffers.items()):
+            if not steps:
+                continue
+            for step in steps:
+                if step.features is None:
+                    continue
+                _append_zero_reward_record(ticker, step.timestamp, step.trade_status_idx, step.features)
+            trade_reward_buffers[ticker] = []
+
+    def _resolve_action_for_reward(
+        ticker: str,
+        inference: Dict[str, Any],
+        executed_map: Dict[str, str],
+    ) -> Tuple[str, int]:
+        if ticker in executed_map:
+            label = executed_map[ticker]
+            idx = canonical_index.get(str(label).lower())
+            if idx is None:
+                idx = int(inference.get("action_idx", hold_idx))
+            return label, idx
+        idx = int(inference.get("action_idx", hold_idx))
+        label = inference.get("action", model_to_config_label.get(idx, MODEL_ACTIONS[idx]))
+        return label, idx
+
+    def _append_zero_reward_record(
+        ticker: str,
+        ts: pd.Timestamp,
+        status_idx: int,
+        features: np.ndarray,
+    ) -> None:
+        nonlocal total_processed, reward_accum, reward_events, min_reward, max_reward
+        status_label = trade_status_list[status_idx]
+        replay_memory.append(
+            {
+                "timestamp": ts.isoformat(),
+                "ticker": ticker,
+                "trade_status_idx": status_idx,
+                "trade_status": status_label,
+                "features": features.tolist(),
+                "reward_vector": [0.0] * len(MODEL_ACTIONS),
+                "best_action_idx": hold_idx,
+                "best_action": model_to_config_label.get(hold_idx, MODEL_ACTIONS[hold_idx]),
+                "P": 0.0,
+                "range_factor": 0.0,
+            }
+        )
+        total_processed += 1
+        reward_events += 1
+        reward_accum += 0.0
+        for canonical in MODEL_ACTIONS:
+            reward_cnt_by_action[canonical] += 1
+        if 0 <= hold_idx < len(action_counts):
+            action_counts[hold_idx] += 1
+        min_reward = min(min_reward, 0.0)
+        max_reward = max(max_reward, 0.0)
+
     # Tracks the last "net %PnL (mark-to-market)" per ticker so reward can be a delta.
     prev_unrealized_pct: Dict[str, float] = {}
+    trade_reward_buffers: Dict[str, List[TradeRewardStep]] = (
+        {ticker: [] for ticker in tickers} if use_trade_proximity else {}
+    )
 
     for ts_idx, ts in enumerate(selected_timestamps):
         local_time = get_time_component(ts)
         if local_time < safe_start_time:
             continue
+        status_snapshot = dict(trade_status_indices)
         next_ts = selected_timestamps[ts_idx + 1] if (ts_idx + 1) < len(selected_timestamps) else None
-        if use_supervised and mode == "training":
+        if use_supervised and mode == "training" and not use_trade_proximity_sl:
             for ticker in tickers:
                 P_val = 0.0
                 range_factor = 0.0
@@ -1362,7 +1544,7 @@ def _generate_replay_memory(
 
         inference_results = infer_actions(model, ticker_features, model_to_config_label)
         # --- BEGIN: minimal exploration to seed executions ---
-        if mode == "training":
+        if mode == "training" and not use_trade_proximity_sl:
             eps = 0.15
             for tkr, res in inference_results.items():
                 if np.random.rand() < eps:
@@ -1446,18 +1628,22 @@ def _generate_replay_memory(
                 qgap_sum += float(top2[-1] - top2[-2])
                 qmean_sum += float(q_vals.mean())
                 qstats_n += 1
-        for result in inference_results.values():
-            action_idx = int(result.get("action_idx", 2))
-            if 0 <= action_idx < len(action_counts):
-                action_counts[action_idx] += 1
+        if not use_trade_proximity_sl:
+            for result in inference_results.values():
+                action_idx = int(result.get("action_idx", 2))
+                if 0 <= action_idx < len(action_counts):
+                    action_counts[action_idx] += 1
         executed_events: List[Dict[str, Any]] = []
         pending_reward_logs: List[Tuple[str, Trade, float, pd.Timestamp, List[Dict[str, Any]]]] = []
+        exited_trades: List[Tuple[str, Trade]] = []
 
         if local_time >= safe_end_time and active_trades:
             for ticker, trade in list(active_trades.items()):
                 price = prices.get(ticker)
                 if price is None:
                     continue
+                trade.highest_price = max(trade.highest_price, price)
+                trade.lowest_price = min(trade.lowest_price, price)
                 exit_action = sell_label if trade.direction == status_long_label else buy_label
                 executed_events.append(
                     {
@@ -1479,29 +1665,85 @@ def _generate_replay_memory(
                 _record_realized_pct(percent_pnl_snapshot[ticker])
                 pending_reward_logs.append((ticker, trade, price, ts, list(executed_events)))
                 _record_holding(trade, ts)
+                exited_trades.append((ticker, trade))
                 trade_status_indices[ticker] = flat_status_idx
                 del active_trades[ticker]
 
-            _fill_reward_snapshot(
-                rl_reward_fn,
-                ts=ts,
-                pnl_snapshot=pnl_snapshot,
-                ticker_features=ticker_features,
-                inference_results=inference_results,
-                executed_events=executed_events,
-                status_before=trade_status_indices,
-                P_lookup=P_lookup,
-                range_lookup=range_factor_lookup,
-                flat_status_idx=flat_status_idx,
-                long_status_idx=long_status_idx,
-                short_status_idx=short_status_idx,
-                prices=prices,
-                active_trades=active_trades,
-                percent_pnl_snapshot=percent_pnl_snapshot,
-                prev_unrealized_pct=prev_unrealized_pct,
-                cost_exchange=cost_exchange,
-                status_long_label=status_long_label,
-            )
+            executed_map = {
+                e.get("ticker"): e.get("action")
+                for e in executed_events
+                if e.get("type") in ("entry", "exit") and e.get("action")
+            }
+            entry_tickers = {
+                e.get("ticker")
+                for e in executed_events
+                if e.get("type") == "entry" and e.get("ticker")
+            }
+
+            if use_trade_proximity_sl:
+                for ticker, st_idx in status_snapshot.items():
+                    if st_idx not in (long_status_idx, short_status_idx):
+                        continue
+                    if ticker in entry_tickers:
+                        continue
+                    price = prices.get(ticker)
+                    feats = ticker_features.get(ticker)
+                    if price is None or feats is None:
+                        continue
+                    label, idx = _resolve_action_for_reward(
+                        ticker,
+                        inference_results.get(ticker, {}),
+                        executed_map,
+                    )
+                    trade_reward_buffers[ticker].append(
+                        TradeRewardStep(
+                            timestamp=ts,
+                            price=price,
+                            action_label=label,
+                            action_idx=idx,
+                            trade_status_idx=st_idx,
+                            features=feats,
+                        )
+                    )
+
+                for ticker, trade in exited_trades:
+                    _finalize_trade_rewards(ticker, trade)
+
+                for ticker, st_idx in status_snapshot.items():
+                    if st_idx != flat_status_idx:
+                        continue
+                    if ticker in entry_tickers:
+                        continue
+                    feats = ticker_features.get(ticker)
+                    if feats is None:
+                        continue
+                    _append_zero_reward_record(ticker, ts, st_idx, feats)
+
+                if verbose and total_processed and total_processed % 1000 == 0:
+                    print(f"[replay:{mode}] Supervised samples generated: {total_processed}")
+                continue
+
+            if not use_trade_proximity_rl:
+                _fill_reward_snapshot(
+                    rl_reward_fn,
+                    ts=ts,
+                    pnl_snapshot=pnl_snapshot,
+                    ticker_features=ticker_features,
+                    inference_results=inference_results,
+                    executed_events=executed_events,
+                    status_before=trade_status_indices,
+                    P_lookup=P_lookup,
+                    range_lookup=range_factor_lookup,
+                    flat_status_idx=flat_status_idx,
+                    long_status_idx=long_status_idx,
+                    short_status_idx=short_status_idx,
+                    prices=prices,
+                    active_trades=active_trades,
+                    percent_pnl_snapshot=percent_pnl_snapshot,
+                    prev_unrealized_pct=prev_unrealized_pct,
+                    cost_exchange=cost_exchange,
+                    status_long_label=status_long_label,
+                )
             _update_reward_stats_from_snapshot(
                 pnl_snapshot,
                 inference_results,
@@ -1510,15 +1752,16 @@ def _generate_replay_memory(
                 reward_cnt_by_action,
                 reward_neg_by_action,
             )
-            for ticker_log, trade_log, price_log, ts_log, events_snapshot in pending_reward_logs:
-                _log_reward_trace(
-                    ticker_log,
-                    trade_log,
-                    price_log,
-                    ts_log,
-                    events_snapshot,
-                    pnl_snapshot.get(ticker_log, 0.0),
-                )
+            if not use_trade_proximity_rl:
+                for ticker_log, trade_log, price_log, ts_log, events_snapshot in pending_reward_logs:
+                    _log_reward_trace(
+                        ticker_log,
+                        trade_log,
+                        price_log,
+                        ts_log,
+                        events_snapshot,
+                        pnl_snapshot.get(ticker_log, 0.0),
+                    )
             pending_reward_logs.clear()
             enhanced_actions = _augment_actions(
                 inference_results,
@@ -1539,6 +1782,36 @@ def _generate_replay_memory(
                 percent_pnl_snapshot,
             )
             total_processed += 1
+            if use_trade_proximity_rl:
+                current_replay_index = len(replay_memory) - 1
+                for ticker, st_idx in status_snapshot.items():
+                    if st_idx not in (long_status_idx, short_status_idx):
+                        continue
+                    if ticker in entry_tickers:
+                        continue
+                    price = prices.get(ticker)
+                    if price is None:
+                        continue
+                    label, idx = _resolve_action_for_reward(
+                        ticker,
+                        inference_results.get(ticker, {}),
+                        executed_map,
+                    )
+                    trade_reward_buffers[ticker].append(
+                        TradeRewardStep(
+                            timestamp=ts,
+                            price=price,
+                            action_label=label,
+                            action_idx=idx,
+                            trade_status_idx=st_idx,
+                            replay_index=current_replay_index,
+                        )
+                    )
+                for ticker, trade in exited_trades:
+                    _finalize_trade_rewards(ticker, trade)
+                reward_events += len(pnl_snapshot)
+                min_reward = min(min_reward, 0.0)
+                max_reward = max(max_reward, 0.0)
             continue
 
         for ticker, result in inference_results.items():
@@ -1552,6 +1825,7 @@ def _generate_replay_memory(
             if trade:
                 if trade.direction == status_long_label:
                     trade.highest_price = max(trade.highest_price, price)
+                    trade.lowest_price = min(trade.lowest_price, price)
                     stop_price = trade.highest_price * (1 - trailing_stop)
                     take_profit_price = trade.entry_price * (1 + take_profit)
                     exit_signal = action_idx == sell_idx
@@ -1591,11 +1865,13 @@ def _generate_replay_memory(
                         )
                         _record_realized_pct(percent_pnl_snapshot[ticker])
                         _record_holding(trade, ts)
+                        exited_trades.append((ticker, trade))
                         trade_status_indices[ticker] = flat_status_idx
                         del active_trades[ticker]
                         continue
                 elif trade.direction == status_short_label:
                     trade.lowest_price = min(trade.lowest_price, price)
+                    trade.highest_price = max(trade.highest_price, price)
                     stop_price = trade.lowest_price * (1 + trailing_stop)
                     take_profit_price = trade.entry_price * (1 - take_profit)
                     exit_signal = action_idx == buy_idx
@@ -1635,6 +1911,7 @@ def _generate_replay_memory(
                         )
                         _record_realized_pct(percent_pnl_snapshot[ticker])
                         _record_holding(trade, ts)
+                        exited_trades.append((ticker, trade))
                         trade_status_indices[ticker] = flat_status_idx
                         del active_trades[ticker]
                         continue
@@ -1692,26 +1969,103 @@ def _generate_replay_memory(
             elif entry_action == sell_label:
                 entry_short += 1
 
-        _fill_reward_snapshot(
-            rl_reward_fn,
-            ts=ts,
-            pnl_snapshot=pnl_snapshot,
-            ticker_features=ticker_features,
-            inference_results=inference_results,
-            executed_events=executed_events,
-            status_before=trade_status_indices,
-            P_lookup=P_lookup,
-            range_lookup=range_factor_lookup,
-            flat_status_idx=flat_status_idx,
-            long_status_idx=long_status_idx,
-            short_status_idx=short_status_idx,
-            prices=prices,
-            active_trades=active_trades,
-            percent_pnl_snapshot=percent_pnl_snapshot,
-            prev_unrealized_pct=prev_unrealized_pct,
-            cost_exchange=cost_exchange,
-            status_long_label=status_long_label,
-        )
+        executed_map = {
+            e.get("ticker"): e.get("action")
+            for e in executed_events
+            if e.get("type") in ("entry", "exit") and e.get("action")
+        }
+        entry_tickers = {
+            e.get("ticker")
+            for e in executed_events
+            if e.get("type") == "entry" and e.get("ticker")
+        }
+
+        if use_trade_proximity_sl:
+            for ticker, st_idx in status_snapshot.items():
+                if st_idx not in (long_status_idx, short_status_idx):
+                    continue
+                if ticker in entry_tickers:
+                    continue
+                price = prices.get(ticker)
+                feats = ticker_features.get(ticker)
+                if price is None or feats is None:
+                    continue
+                label, idx = _resolve_action_for_reward(
+                    ticker,
+                    inference_results.get(ticker, {}),
+                    executed_map,
+                )
+                trade_reward_buffers[ticker].append(
+                    TradeRewardStep(
+                        timestamp=ts,
+                        price=price,
+                        action_label=label,
+                        action_idx=idx,
+                        trade_status_idx=st_idx,
+                        features=feats,
+                    )
+                )
+
+            for ticker, trade in exited_trades:
+                _finalize_trade_rewards(ticker, trade)
+
+            for ticker in entry_tickers:
+                feats = ticker_features.get(ticker)
+                price = prices.get(ticker)
+                if feats is None or price is None:
+                    continue
+                st_idx = status_snapshot.get(ticker, flat_status_idx)
+                label, idx = _resolve_action_for_reward(
+                    ticker,
+                    inference_results.get(ticker, {}),
+                    executed_map,
+                )
+                trade_reward_buffers[ticker].append(
+                    TradeRewardStep(
+                        timestamp=ts,
+                        price=price,
+                        action_label=label,
+                        action_idx=idx,
+                        trade_status_idx=st_idx,
+                        features=feats,
+                    )
+                )
+
+            for ticker, st_idx in status_snapshot.items():
+                if st_idx != flat_status_idx:
+                    continue
+                if ticker in entry_tickers:
+                    continue
+                feats = ticker_features.get(ticker)
+                if feats is None:
+                    continue
+                _append_zero_reward_record(ticker, ts, st_idx, feats)
+
+            if verbose and total_processed and total_processed % 1000 == 0:
+                print(f"[replay:{mode}] Supervised samples generated: {total_processed}")
+            continue
+
+        if not use_trade_proximity_rl:
+            _fill_reward_snapshot(
+                rl_reward_fn,
+                ts=ts,
+                pnl_snapshot=pnl_snapshot,
+                ticker_features=ticker_features,
+                inference_results=inference_results,
+                executed_events=executed_events,
+                status_before=trade_status_indices,
+                P_lookup=P_lookup,
+                range_lookup=range_factor_lookup,
+                flat_status_idx=flat_status_idx,
+                long_status_idx=long_status_idx,
+                short_status_idx=short_status_idx,
+                prices=prices,
+                active_trades=active_trades,
+                percent_pnl_snapshot=percent_pnl_snapshot,
+                prev_unrealized_pct=prev_unrealized_pct,
+                cost_exchange=cost_exchange,
+                status_long_label=status_long_label,
+            )
         _update_reward_stats_from_snapshot(
             pnl_snapshot,
             inference_results,
@@ -1720,15 +2074,16 @@ def _generate_replay_memory(
             reward_cnt_by_action,
             reward_neg_by_action,
         )
-        for ticker_log, trade_log, price_log, ts_log, events_snapshot in pending_reward_logs:
-            _log_reward_trace(
-                ticker_log,
-                trade_log,
-                price_log,
-                ts_log,
-                events_snapshot,
-                pnl_snapshot.get(ticker_log, 0.0),
-            )
+        if not use_trade_proximity_rl:
+            for ticker_log, trade_log, price_log, ts_log, events_snapshot in pending_reward_logs:
+                _log_reward_trace(
+                    ticker_log,
+                    trade_log,
+                    price_log,
+                    ts_log,
+                    events_snapshot,
+                    pnl_snapshot.get(ticker_log, 0.0),
+                )
         pending_reward_logs.clear()
 
         enhanced_actions = _augment_actions(
@@ -1751,21 +2106,75 @@ def _generate_replay_memory(
             percent_pnl_snapshot,
         )
         total_processed += 1
+        if use_trade_proximity_rl:
+            current_replay_index = len(replay_memory) - 1
+            for ticker, st_idx in status_snapshot.items():
+                if st_idx not in (long_status_idx, short_status_idx):
+                    continue
+                if ticker in entry_tickers:
+                    continue
+                price = prices.get(ticker)
+                if price is None:
+                    continue
+                label, idx = _resolve_action_for_reward(
+                    ticker,
+                    inference_results.get(ticker, {}),
+                    executed_map,
+                )
+                trade_reward_buffers[ticker].append(
+                    TradeRewardStep(
+                        timestamp=ts,
+                        price=price,
+                        action_label=label,
+                        action_idx=idx,
+                        trade_status_idx=st_idx,
+                        replay_index=current_replay_index,
+                    )
+                )
+            for ticker, trade in exited_trades:
+                _finalize_trade_rewards(ticker, trade)
+            for ticker in entry_tickers:
+                price = prices.get(ticker)
+                if price is None:
+                    continue
+                st_idx = status_snapshot.get(ticker, flat_status_idx)
+                label, idx = _resolve_action_for_reward(
+                    ticker,
+                    inference_results.get(ticker, {}),
+                    executed_map,
+                )
+                trade_reward_buffers[ticker].append(
+                    TradeRewardStep(
+                        timestamp=ts,
+                        price=price,
+                        action_label=label,
+                        action_idx=idx,
+                        trade_status_idx=st_idx,
+                        replay_index=current_replay_index,
+                    )
+                )
 
-        reward_accum += sum(pnl_snapshot.values())
-        reward_events += len(pnl_snapshot)
-        for val in pnl_snapshot.values():
-            if val is None:
-                continue
-            if val < min_reward:
-                min_reward = val
-            if val > max_reward:
-                max_reward = val
-            if val < 0:
-                negative_rewards += 1
+        if not use_trade_proximity_rl:
+            reward_accum += sum(pnl_snapshot.values())
+            reward_events += len(pnl_snapshot)
+            for val in pnl_snapshot.values():
+                if val is None:
+                    continue
+                if val < min_reward:
+                    min_reward = val
+                if val > max_reward:
+                    max_reward = val
+                if val < 0:
+                    negative_rewards += 1
+        else:
+            reward_events += len(pnl_snapshot)
+            min_reward = min(min_reward, 0.0)
+            max_reward = max(max_reward, 0.0)
 
         if verbose and total_processed % 100 == 0:
             print(f"[replay:{mode}] Processed {total_processed} timestamps")
+
+    _flush_open_trade_buffers_zero_reward()
 
     avg_pct_pnl = None
     total_pct_pnl = None

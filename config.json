@@ -69,7 +69,7 @@
     "sell"
   ],
   "reward": {
-    "rl": "proximity_cubic_range",
+    "rl": "trade_proximity_cubic_range",
     "sl": "proximity_cubic_range"
   },
   "training_days_num": 25,
@@ -82,7 +82,7 @@
   "training_trailing_stop_loss_pct": 1.0,
   "evaluation_trailing_stop_loss_pct": 0.01,
   "training_take_profit_pct": 1.0,
-  "evaluation_take_profit_pct": 0.005,
+  "evaluation_take_profit_pct": 0.01,
   "tuning": {
     "trailing_stop_candidates": [
       0.0025,

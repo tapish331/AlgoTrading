@@ -38,8 +38,18 @@ MODEL_ACTIONS = ["hold", "buy", "sell"]
 
 _HISTORY_CACHE: Dict[Path, Tuple[int, int, pd.DataFrame]] = {}
 
-SUPPORTED_RL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range", "trade_proximity_cubic_range"}
-SUPPORTED_SL_REWARDS = {"net_pct_pnl_delta", "proximity_cubic_range", "trade_proximity_cubic_range"}
+SUPPORTED_RL_REWARDS = {
+    "net_pct_pnl_delta",
+    "proximity_cubic_range",
+    "proximity_cubic_range_so_far",
+    "trade_proximity_cubic_range",
+}
+SUPPORTED_SL_REWARDS = {
+    "net_pct_pnl_delta",
+    "proximity_cubic_range",
+    "proximity_cubic_range_so_far",
+    "trade_proximity_cubic_range",
+}
 
 ZERODHA_BROKERAGE_PCT = 0.0003  # 0.03%
 ZERODHA_BROKERAGE_CAP = 20.0  # Rs per executed order
@@ -295,6 +305,28 @@ def _build_daily_P_lookup(decision_df: pd.DataFrame) -> Dict[pd.Timestamp, float
     return {ts: p for ts, p in zip(df["date"], P)}
 
 
+def _build_daily_P_lookup_so_far(decision_df: pd.DataFrame) -> Dict[pd.Timestamp, float]:
+    # Use running intraday highs/lows up to each candle.
+    df = decision_df.copy()
+    df["day"] = df["date"].dt.tz_convert(INDIA_TZ).dt.normalize()
+    P_lookup: Dict[pd.Timestamp, float] = {}
+    for _, group in df.groupby("day"):
+        group_sorted = group.sort_values("date")
+        highs = group_sorted["high"].to_numpy(float)
+        lows = group_sorted["low"].to_numpy(float)
+        closes = group_sorted["close"].to_numpy(float)
+        running_high = np.maximum.accumulate(highs)
+        running_low = np.minimum.accumulate(lows)
+        for ts, close, day_low, day_high in zip(
+            group_sorted["date"],
+            closes,
+            running_low,
+            running_high,
+        ):
+            P_lookup[ts] = _proximity_P_for_day(float(close), float(day_low), float(day_high))
+    return P_lookup
+
+
 def _build_daily_range_factor_lookup(decision_df: pd.DataFrame) -> Dict[pd.Timestamp, float]:
     """
     For each timestamp, return (day_high - day_low) / day_low * 100
@@ -313,6 +345,24 @@ def _build_daily_range_factor_lookup(decision_df: pd.DataFrame) -> Dict[pd.Times
         range_pct = np.where(day_low > 0.0, (day_high - day_low) / day_low * 100.0, 0.0)
 
     return {ts: float(rp) for ts, rp in zip(df["date"], range_pct)}
+
+
+def _build_daily_range_factor_lookup_so_far(decision_df: pd.DataFrame) -> Dict[pd.Timestamp, float]:
+    """
+    For each timestamp, return (day_high_so_far - day_low_so_far) / day_low_so_far * 100.
+    """
+    df = decision_df.copy()
+    df["day"] = df["date"].dt.tz_convert(INDIA_TZ).dt.normalize()
+    range_lookup: Dict[pd.Timestamp, float] = {}
+    for _, group in df.groupby("day"):
+        group_sorted = group.sort_values("date")
+        highs = group_sorted["high"].to_numpy(float)
+        lows = group_sorted["low"].to_numpy(float)
+        running_high = np.maximum.accumulate(highs)
+        running_low = np.minimum.accumulate(lows)
+        for ts, day_low, day_high in zip(group_sorted["date"], running_low, running_high):
+            range_lookup[ts] = _range_factor_from_low_high(float(day_low), float(day_high))
+    return range_lookup
 
 
 def _range_factor_from_low_high(low: float, high: float) -> float:
@@ -732,7 +782,7 @@ def _fill_reward_snapshot(
     cost_exchange: str,
     status_long_label: str,
 ) -> None:
-    if reward_fn == "proximity_cubic_range":
+    if reward_fn in ("proximity_cubic_range", "proximity_cubic_range_so_far"):
         _fill_reward_snapshot_from_P(
             ts,
             pnl_snapshot,
@@ -1076,12 +1126,45 @@ def _generate_replay_memory(
     decision_positions = {
         ticker: compute_day_positions(decision_data[ticker]) for ticker in tickers
     }
-    P_lookup: Dict[str, Dict[pd.Timestamp, float]] = {
-        ticker: _build_daily_P_lookup(decision_data[ticker]) for ticker in tickers
-    }
-    range_factor_lookup: Dict[str, Dict[pd.Timestamp, float]] = {
-        ticker: _build_daily_range_factor_lookup(decision_data[ticker]) for ticker in tickers
-    }
+    P_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
+    range_factor_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
+    P_lookup_so_far: Dict[str, Dict[pd.Timestamp, float]] = {}
+    range_factor_lookup_so_far: Dict[str, Dict[pd.Timestamp, float]] = {}
+    if rl_reward_fn == "proximity_cubic_range" or (
+        use_supervised and sl_reward_fn == "proximity_cubic_range"
+    ):
+        P_lookup = {
+            ticker: _build_daily_P_lookup(decision_data[ticker]) for ticker in tickers
+        }
+        range_factor_lookup = {
+            ticker: _build_daily_range_factor_lookup(decision_data[ticker]) for ticker in tickers
+        }
+    if rl_reward_fn == "proximity_cubic_range_so_far" or (
+        use_supervised and sl_reward_fn == "proximity_cubic_range_so_far"
+    ):
+        P_lookup_so_far = {
+            ticker: _build_daily_P_lookup_so_far(decision_data[ticker]) for ticker in tickers
+        }
+        range_factor_lookup_so_far = {
+            ticker: _build_daily_range_factor_lookup_so_far(decision_data[ticker]) for ticker in tickers
+        }
+
+    P_lookup_rl = (
+        P_lookup_so_far if rl_reward_fn == "proximity_cubic_range_so_far" else P_lookup
+    )
+    range_factor_lookup_rl = (
+        range_factor_lookup_so_far
+        if rl_reward_fn == "proximity_cubic_range_so_far"
+        else range_factor_lookup
+    )
+    P_lookup_sl = (
+        P_lookup_so_far if sl_reward_fn == "proximity_cubic_range_so_far" else P_lookup
+    )
+    range_factor_lookup_sl = (
+        range_factor_lookup_so_far
+        if sl_reward_fn == "proximity_cubic_range_so_far"
+        else range_factor_lookup
+    )
 
     common_timestamps = compute_common_timestamps(decision_data)
     min_valid_ts = compute_min_valid_timestamp(history, timeframes, lookback)
@@ -1394,9 +1477,9 @@ def _generate_replay_memory(
             for ticker in tickers:
                 P_val = 0.0
                 range_factor = 0.0
-                if sl_reward_fn == "proximity_cubic_range":
-                    P_val = float(P_lookup.get(ticker, {}).get(ts, 0.0))
-                    range_factor = float(range_factor_lookup.get(ticker, {}).get(ts, 0.0))
+                if sl_reward_fn in ("proximity_cubic_range", "proximity_cubic_range_so_far"):
+                    P_val = float(P_lookup_sl.get(ticker, {}).get(ts, 0.0))
+                    range_factor = float(range_factor_lookup_sl.get(ticker, {}).get(ts, 0.0))
                     if range_factor == 0.0 and P_val == 0.0:
                         continue
                     net_long = net_short = exit_long = exit_short = 0.0
@@ -1732,8 +1815,8 @@ def _generate_replay_memory(
                     inference_results=inference_results,
                     executed_events=executed_events,
                     status_before=trade_status_indices,
-                    P_lookup=P_lookup,
-                    range_lookup=range_factor_lookup,
+                    P_lookup=P_lookup_rl,
+                    range_lookup=range_factor_lookup_rl,
                     flat_status_idx=flat_status_idx,
                     long_status_idx=long_status_idx,
                     short_status_idx=short_status_idx,
@@ -2054,8 +2137,8 @@ def _generate_replay_memory(
                 inference_results=inference_results,
                 executed_events=executed_events,
                 status_before=trade_status_indices,
-                P_lookup=P_lookup,
-                range_lookup=range_factor_lookup,
+                P_lookup=P_lookup_rl,
+                range_lookup=range_factor_lookup_rl,
                 flat_status_idx=flat_status_idx,
                 long_status_idx=long_status_idx,
                 short_status_idx=short_status_idx,

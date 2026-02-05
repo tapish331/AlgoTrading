@@ -69,8 +69,8 @@
     "sell"
   ],
   "reward": {
-    "rl": "trade_proximity_cubic_range",
-    "sl": "proximity_cubic_range"
+    "rl": "proximity_cubic_range_so_far",
+    "sl": "proximity_cubic_range_so_far"
   },
   "training_days_num": 25,
   "evaluation_days_num": 5,

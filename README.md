@@ -98,7 +98,7 @@ Feature vectors are assembled per ticker from normalized OHLCV windows across ev
 | Top-level | `index`, `tickers`, `timeframes`, `decision_interval`, `actions` | Refresh tickers via `nse.py`; `decision_interval` must be in `timeframes`. |
 | Session limits | `safe_start_time`, `safe_end_time`, `hard_end_time` | Trading waits until safe start, closes positions at safe end, and force-square-offs at hard end. |
 | Risk & sizing | `training_trailing_stop_loss_pct`, `evaluation_trailing_stop_loss_pct`, `training_take_profit_pct`, `evaluation_take_profit_pct`, `max_concurrent_trades`, `capital_per_ticker`, `leverage` | Used by `replay.py`/`trade.py` for position sizing and exit rules. |
-| Fetch | `fetch.num_candles` | Controls the number of most recent candles stored per timeframe/ticker. |
+| Fetch | `fetch.num_candles`, `fetch.retain_trading_days` | `num_candles` controls bootstrap/backfill depth. `retain_trading_days` hard-caps persisted history to the most recent trading sessions per ticker/timeframe. |
 | Training | `training_days_num`, `evaluation_days_num`, `train.lookback`, `ml_rl.hidden_layers_num`, `ml_rl.learning_rate`, `ml_rl.batch_size`, `ml_rl.epochs` | Replay generation and model hyper-parameters. |
 | Trading block | `trading.mode`, `trading.poll_interval_seconds` | `mode` defaults to `paper`. Switch to `live` only after verifying the entire stack. |
 | Trade status | `trade_status` array | Drives action masking and the state feature appended to every observation (`flat`, `long`, `short`). |
@@ -120,7 +120,7 @@ python zerodha_broker.py --ensure_access_token --verbose  # run once per day
 python fetch.py --verbose
 ```
 
-`fetch.py` performs: ticker refresh → token check → bulk historical download for every ticker/timeframe into `data/`, deduplicating existing CSVs. Configure `fetch.fetch.num_candles` to control depth.
+`fetch.py` performs: ticker refresh → token check → bulk historical download for every ticker/timeframe into `data/`, deduplicating existing CSVs. Configure `fetch.num_candles` for bootstrap depth and `fetch.retain_trading_days` to cap stored history size.
 
 ### 3. Build replay memory
 

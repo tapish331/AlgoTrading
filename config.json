@@ -124,7 +124,8 @@
     "short"
   ],
   "fetch": {
-    "num_candles": 22000
+    "num_candles": 22000,
+    "retain_trading_days": 60
   },
   "ml_rl": {
     "hidden_layers_num": 5,

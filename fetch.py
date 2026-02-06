@@ -21,6 +21,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE_PREFIX = "fetch"
+INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
 def _load_logging_config(path: Path) -> Dict[str, object]:
@@ -206,6 +207,8 @@ def run_pipeline(verbose: bool = False) -> None:
     timeframes: Iterable[str] = config.get("timeframes") or []
     fetch_config = config.get("fetch") if isinstance(config.get("fetch"), dict) else {}
     num_candles = fetch_config.get("num_candles")
+    retain_trading_days_raw = fetch_config.get("retain_trading_days")
+    retain_trading_days: Optional[int] = None
 
     base_dir = DATA_DIR
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +217,12 @@ def run_pipeline(verbose: bool = False) -> None:
         raise RuntimeError("config.json must define timeframes with at least one entry.")
     if not isinstance(num_candles, int) or num_candles <= 0:
         raise RuntimeError("config.json must define fetch.num_candles as a positive integer.")
+    if retain_trading_days_raw is not None:
+        if not isinstance(retain_trading_days_raw, int) or retain_trading_days_raw <= 0:
+            raise RuntimeError(
+                "config.json fetch.retain_trading_days must be a positive integer when provided."
+            )
+        retain_trading_days = retain_trading_days_raw
 
     tickers: List[str] = list(config.get("tickers") or [])
     if not tickers:
@@ -225,6 +234,8 @@ def run_pipeline(verbose: bool = False) -> None:
             f"[fetch] Fetching {num_candles} candles for {len_tickers} tickers "
             f"across timeframes: {', '.join(timeframes)}"
         )
+        if retain_trading_days is not None:
+            print(f"[fetch] Retention target: last {retain_trading_days} trading day(s) per file")
 
     for ticker in tickers:
         if verbose:
@@ -240,7 +251,20 @@ def run_pipeline(verbose: bool = False) -> None:
                 )
 
                 initial_count = len(existing_df)
+                pre_trimmed_days = 0
+                post_trimmed_days = 0
                 combined_df: pd.DataFrame
+
+                if retain_trading_days is not None and not existing_df.empty:
+                    existing_df, pre_trimmed_days = _trim_to_recent_trading_days(
+                        existing_df,
+                        retain_trading_days,
+                    )
+                    if pre_trimmed_days and verbose:
+                        print(
+                            "[fetch]  -> Retention pre-trim removed "
+                            f"{pre_trimmed_days} trading day(s)"
+                        )
 
                 if existing_df.empty:
                     if verbose:
@@ -255,7 +279,8 @@ def run_pipeline(verbose: bool = False) -> None:
                     combined_df = new_df
                 else:
                     existing_count = len(existing_df)
-                    if existing_count < num_candles:
+                    should_backfill = retain_trading_days is None and existing_count < num_candles
+                    if should_backfill:
                         if verbose:
                             print(
                                 "[fetch]  -> Backfilling older data "
@@ -290,13 +315,28 @@ def run_pipeline(verbose: bool = False) -> None:
                             new_df = _candles_to_dataframe(candles)
                             combined_df = _merge_existing_and_new(existing_df, new_df)
 
+                if retain_trading_days is not None and combined_df is not None and not combined_df.empty:
+                    combined_df, post_trimmed_days = _trim_to_recent_trading_days(
+                        combined_df,
+                        retain_trading_days,
+                    )
+                    if post_trimmed_days and verbose:
+                        print(
+                            "[fetch]  -> Retention post-merge trim removed "
+                            f"{post_trimmed_days} trading day(s)"
+                        )
+
                 if combined_df is None or combined_df.empty:
                     if verbose:
                         print("[fetch]  -> No data to write")
                     continue
 
                 combined_count = len(combined_df)
-                updated = combined_count > initial_count
+                updated = (
+                    combined_count != initial_count
+                    or pre_trimmed_days > 0
+                    or post_trimmed_days > 0
+                )
 
                 if not updated:
                     if verbose:
@@ -344,6 +384,34 @@ def _merge_existing_and_new(
         combined.sort_values(by="date", inplace=True)
     combined.reset_index(drop=True, inplace=True)
     return combined
+
+
+def _trim_to_recent_trading_days(
+    dataframe: pd.DataFrame,
+    retain_trading_days: Optional[int],
+) -> tuple[pd.DataFrame, int]:
+    """Keep only the most recent N trading days in the dataset."""
+    if (
+        dataframe is None
+        or dataframe.empty
+        or retain_trading_days is None
+        or retain_trading_days <= 0
+        or "date" not in dataframe.columns
+    ):
+        return dataframe, 0
+
+    parsed_dates = pd.to_datetime(dataframe["date"], utc=True, errors="coerce")
+    trading_days = parsed_dates.dt.tz_convert(INDIA_TZ).dt.date
+    unique_days = sorted({day for day in trading_days.dropna().tolist()})
+    total_days = len(unique_days)
+    if total_days <= retain_trading_days:
+        return dataframe, 0
+
+    keep_days = set(unique_days[-retain_trading_days:])
+    keep_mask = trading_days.isin(keep_days) | trading_days.isna()
+    trimmed = dataframe.loc[keep_mask].copy()
+    trimmed.reset_index(drop=True, inplace=True)
+    return trimmed, total_days - retain_trading_days
 
 
 def _ensure_datetime(value: object) -> datetime:

@@ -273,7 +273,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             train_agent(train_args)
 
-            eval_summary = populate_evaluation_replay_memory(verbose=args.verbose)
+            promotion_trailing_stop = float(
+                config.get("training_trailing_stop_loss_pct", config.get("evaluation_trailing_stop_loss_pct"))
+            )
+            promotion_take_profit = float(
+                config.get("training_take_profit_pct", config.get("evaluation_take_profit_pct"))
+            )
+            if args.verbose:
+                print(
+                    "[train] Promotion scoring overrides | "
+                    f"trailing_stop={promotion_trailing_stop:.4f} "
+                    f"take_profit={promotion_take_profit:.4f}"
+                )
+
+            eval_summary = populate_evaluation_replay_memory(
+                verbose=args.verbose,
+                override_trailing_stop=promotion_trailing_stop,
+                override_take_profit=promotion_take_profit,
+            )
             current_avg_reward = eval_summary.get("avg_reward", float("nan"))
             current_avg_pct_pnl = eval_summary.get("avg_pct_pnl")
             current_total_pct_pnl = eval_summary.get("total_pct_pnl")

@@ -28,7 +28,7 @@ from replay import (
     populate_training_replay_memory,
 )
 from tune_take_profit_and_trailing_stop_loss import (
-    DEFAULT_CANDIDATES as GRID_CANDIDATES,
+    DEFAULT_ATR_MULTIPLIER_CANDIDATES as GRID_CANDIDATES,
     DEFAULT_METRIC as GRID_METRIC,
     tune_take_profit_and_trailing_stop_loss,
 )
@@ -131,12 +131,16 @@ def _save_meta(meta: Dict[str, Any]) -> None:
 
 
 def _run_pair_tuning(verbose: bool) -> None:
-    """Re-evaluate evaluation trailing stop and take profit pct after promoting a new winner."""
+    """Re-evaluate evaluation ATR trailing stop and take profit multipliers after promotion."""
     try:
         cfg = load_config()
         tuning_cfg = cfg.get("tuning", {})
-        trailing_candidates = [float(v) for v in tuning_cfg.get("trailing_stop_candidates", GRID_CANDIDATES)]
-        take_profit_candidates = [float(v) for v in tuning_cfg.get("take_profit_candidates", GRID_CANDIDATES)]
+        trailing_candidates = [
+            float(v) for v in tuning_cfg.get("trailing_stop_atr_multiplier_candidates", GRID_CANDIDATES)
+        ]
+        take_profit_candidates = [
+            float(v) for v in tuning_cfg.get("take_profit_atr_multiplier_candidates", GRID_CANDIDATES)
+        ]
         metric = str(
             tuning_cfg.get("pair_metric")
             or tuning_cfg.get("grid_metric")
@@ -274,16 +278,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             train_agent(train_args)
 
             promotion_trailing_stop = float(
-                config.get("training_trailing_stop_loss_pct", config.get("evaluation_trailing_stop_loss_pct"))
+                config.get(
+                    "training_trailing_stop_atr_multiplier",
+                    config.get("evaluation_trailing_stop_atr_multiplier"),
+                )
             )
             promotion_take_profit = float(
-                config.get("training_take_profit_pct", config.get("evaluation_take_profit_pct"))
+                config.get(
+                    "training_take_profit_atr_multiplier",
+                    config.get("evaluation_take_profit_atr_multiplier"),
+                )
             )
             if args.verbose:
                 print(
                     "[train] Promotion scoring overrides | "
-                    f"trailing_stop={promotion_trailing_stop:.4f} "
-                    f"take_profit={promotion_take_profit:.4f}"
+                    f"trailing_stop_mult={promotion_trailing_stop:.4f} "
+                    f"take_profit_mult={promotion_take_profit:.4f}"
                 )
 
             eval_summary = populate_evaluation_replay_memory(

@@ -97,7 +97,7 @@ Feature vectors are assembled per ticker from normalized OHLCV windows across ev
 | --- | --- | --- |
 | Top-level | `index`, `tickers`, `timeframes`, `decision_interval`, `actions` | Refresh tickers via `nse.py`; `decision_interval` must be in `timeframes`. |
 | Session limits | `safe_start_time`, `safe_end_time`, `hard_end_time` | Trading waits until safe start, closes positions at safe end, and force-square-offs at hard end. |
-| Risk & sizing | `training_trailing_stop_loss_pct`, `evaluation_trailing_stop_loss_pct`, `training_take_profit_pct`, `evaluation_take_profit_pct`, `max_concurrent_trades`, `capital_per_ticker`, `leverage` | Used by `replay.py`/`trade.py` for position sizing and exit rules. |
+| Risk & sizing | `training_trailing_stop_atr_period`, `evaluation_trailing_stop_atr_period`, `training_trailing_stop_atr_multiplier`, `evaluation_trailing_stop_atr_multiplier`, `training_take_profit_atr_period`, `evaluation_take_profit_atr_period`, `training_take_profit_atr_multiplier`, `evaluation_take_profit_atr_multiplier`, `max_concurrent_trades`, `capital_per_ticker`, `leverage` | Used by `replay.py`/`trade.py` for ATR-based trailing stop and take-profit exit rules. |
 | Fetch | `fetch.num_candles`, `fetch.retain_trading_days` | `num_candles` controls bootstrap/backfill depth. `retain_trading_days` hard-caps persisted history to the most recent trading sessions per ticker/timeframe. |
 | Training | `training_days_num`, `evaluation_days_num`, `train.lookback`, `ml_rl.hidden_layers_num`, `ml_rl.learning_rate`, `ml_rl.batch_size`, `ml_rl.epochs` | Replay generation and model hyper-parameters. |
 | Trading block | `trading.mode`, `trading.poll_interval_seconds` | `mode` defaults to `paper`. Switch to `live` only after verifying the entire stack. |
@@ -161,7 +161,7 @@ python trade.py --verbose --poll-seconds 5
 2. Restores `state/active_trades.json` and reconciles with live broker positions (in live mode).
 3. Each loop fetches a fresh snapshot via `fetch_market_snapshot`, rebuilds features, and infers actions for every ticker.
 4. Only the highest-confidence actionable ticker per cycle can open a new position, respecting `max_concurrent_trades`.
-5. Trailing stops (`evaluation_trailing_stop_loss_pct`), take-profit targets (`evaluation_take_profit_pct`), and opposite signals close positions. Safe/hard windows force square-offs and completed trades are appended to `state/completed_trades/<date>.jsonl`.
+5. Trailing stops (`evaluation_trailing_stop_atr_multiplier` with `evaluation_trailing_stop_atr_period`), take-profit targets (`evaluation_take_profit_atr_multiplier` with `evaluation_take_profit_atr_period`), and opposite signals close positions. Safe/hard windows force square-offs and completed trades are appended to `state/completed_trades/<date>.jsonl`.
 6. The loop defaults to `trading.mode = paper`; set `live` only after dry-running end to end.
 
 Interrupting the script performs an orderly square-off and persists state so the next session resumes safely.

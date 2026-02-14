@@ -1,4 +1,4 @@
-"""Tune the evaluation take profit percentage using replay evaluation."""
+"""Tune the evaluation take profit ATR multiplier using replay evaluation."""
 
 from __future__ import annotations
 
@@ -10,23 +10,20 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from replay import CONFIG_PATH, load_config, populate_evaluation_replay_memory
 
-# Default search space if config does not define one.
-DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
+DEFAULT_CANDIDATES: List[float] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
 DEFAULT_METRIC = "pnl_tstat"
 
 
 def _write_config(config: Dict[str, Any], path: Path, verbose: bool) -> None:
-    """Persist the provided configuration to disk."""
     serialized = json.dumps(config, indent=2)
     path.write_text(serialized + "\n", encoding="utf-8")
     if verbose:
-        tp_val = config.get("evaluation_take_profit_pct")
+        tp_val = config.get("evaluation_take_profit_atr_multiplier")
         take_profit = f"{float(tp_val):.4f}" if isinstance(tp_val, (float, int)) else "n/a"
-        print(f"[tune] Wrote config to {path} with evaluation_take_profit_pct={take_profit}")
+        print(f"[tune] Wrote config to {path} with evaluation_take_profit_atr_multiplier={take_profit}")
 
 
 def _score_summary(summary: Dict[str, Any], metric: str) -> float:
-    """Extract a numeric score from replay summary."""
     value = summary.get(metric)
     if value is None:
         return float("-inf")
@@ -53,7 +50,7 @@ def _parse_candidates(raw: str | None, config: Dict[str, Any]) -> List[float]:
         candidates = [float(p) for p in parts]
     else:
         tuning_cfg = config.get("tuning", {})
-        candidates = [float(v) for v in tuning_cfg.get("take_profit_candidates", DEFAULT_CANDIDATES)]
+        candidates = [float(v) for v in tuning_cfg.get("take_profit_atr_multiplier_candidates", DEFAULT_CANDIDATES)]
     return _dedupe_preserve_order(candidates)
 
 
@@ -75,9 +72,9 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
 
     base_config = load_config(CONFIG_PATH)
     original_config = copy.deepcopy(base_config)
-    training_ts_raw = base_config.get("training_trailing_stop_loss_pct")
+    training_ts_raw = base_config.get("training_trailing_stop_atr_multiplier")
     if training_ts_raw is None:
-        raise ValueError("Config must define 'training_trailing_stop_loss_pct' for take profit tuning.")
+        raise ValueError("Config must define 'training_trailing_stop_atr_multiplier' for take profit tuning.")
     training_trailing_stop = float(training_ts_raw)
     best_value = None
     best_score = float("-inf")
@@ -86,20 +83,21 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
 
     if verbose:
         joined = ", ".join(f"{c:.4f}" for c in candidates)
-        print(f"[tune] Evaluating {len(candidates)} take profit values: [{joined}] using metric '{metric}'")
+        print(f"[tune] Evaluating {len(candidates)} take profit multipliers: [{joined}] using metric '{metric}'")
         print(
-            f"[tune] Fixed evaluation_trailing_stop_loss_pct={training_trailing_stop:.4f} "
-            "(from training_trailing_stop_loss_pct)"
+            f"[tune] Fixed evaluation_trailing_stop_atr_multiplier={training_trailing_stop:.4f} "
+            "(from training_trailing_stop_atr_multiplier)"
         )
 
     try:
         for idx, candidate in enumerate(candidates, start=1):
             if verbose:
-                print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with take_profit={candidate:.4f}")
+                print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with take_profit_mult={candidate:.4f}")
 
             summary = populate_evaluation_replay_memory(
                 verbose=verbose,
                 override_trailing_stop=training_trailing_stop,
+                override_take_profit=candidate,
             )
             score = _score_summary(summary, metric)
             results.append((candidate, score))
@@ -108,7 +106,7 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
                 pnl = summary.get("avg_pct_pnl")
                 pnl_str = f"{pnl:.4f}%" if isinstance(pnl, (float, int)) and pnl is not None else "n/a"
                 print(
-                    f"[tune] completed take_profit={candidate:.4f} | "
+                    f"[tune] completed take_profit_mult={candidate:.4f} | "
                     f"{metric}={score:.4f} | avg_pct_pnl={pnl_str}"
                 )
 
@@ -120,15 +118,15 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
         raise
 
     if best_value is None:
-        raise RuntimeError("Unable to determine best take profit value; all candidates failed.")
+        raise RuntimeError("Unable to determine best take profit multiplier; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)
-    final_config["evaluation_take_profit_pct"] = best_value
+    final_config["evaluation_take_profit_atr_multiplier"] = best_value
     _write_config(final_config, CONFIG_PATH, verbose=verbose)
 
     if verbose:
         print(
-            f"[tune] Best take profit={best_value:.4f} with {metric}={best_score:.4f}; "
+            f"[tune] Best take profit multiplier={best_value:.4f} with {metric}={best_score:.4f}; "
             f"config updated at {CONFIG_PATH}"
         )
         print(
@@ -141,19 +139,22 @@ def tune_take_profit(candidates: List[float], metric: str, verbose: bool) -> Tup
             marker = "<- best" if val == best_value else ""
             print(f"  {val:.4f}: {score:.4f} {marker}")
     else:
-        print(f"Updated evaluation_take_profit_pct to {best_value:.4f} (metric '{metric}'={best_score:.4f})")
+        print(
+            f"Updated evaluation_take_profit_atr_multiplier to {best_value:.4f} "
+            f"(metric '{metric}'={best_score:.4f})"
+        )
 
     return best_value, best_summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tune evaluation take profit percentage and update config.json.",
+        description="Tune evaluation take profit ATR multiplier and update config.json.",
     )
     parser.add_argument(
         "--candidates",
         type=str,
-        help="Comma-separated take profit pct values to evaluate. Example: 0.005,0.01,0.02",
+        help="Comma-separated take profit ATR multipliers to evaluate. Example: 1.0,1.5,2.0",
     )
     parser.add_argument(
         "--metric",

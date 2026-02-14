@@ -75,6 +75,8 @@ class Trade:
     lowest_price: float
     highest_price_time: Optional[str] = None
     lowest_price_time: Optional[str] = None
+    trailing_stop_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
     data_timestamp: Optional[str] = None
 
 
@@ -268,6 +270,51 @@ def compute_day_positions(df: pd.DataFrame) -> Dict[pd.Timestamp, Tuple[int, int
         for idx, ts in enumerate(group_sorted["date"]):
             positions[ts] = (idx, total)
     return positions
+
+
+def _compute_atr_series(decision_df: pd.DataFrame, period: int) -> pd.Series:
+    if period <= 0 or decision_df.empty:
+        return pd.Series(dtype=float)
+    required = {"date", "high", "low", "close"}
+    missing = [col for col in required if col not in decision_df.columns]
+    if missing:
+        return pd.Series(dtype=float)
+    df = (
+        decision_df[["date", "high", "low", "close"]]
+        .copy()
+        .sort_values("date", kind="mergesort")
+        .drop_duplicates("date", keep="first")
+        .reset_index(drop=True)
+    )
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=(1.0 / period), adjust=False, min_periods=period).mean()
+    atr.index = df["date"]
+    return atr
+
+
+def build_atr_lookup(decision_df: pd.DataFrame, period: int) -> Dict[pd.Timestamp, float]:
+    atr = _compute_atr_series(decision_df, period)
+    if atr.empty:
+        return {}
+    lookup: Dict[pd.Timestamp, float] = {}
+    for ts, value in atr.items():
+        if pd.isna(value):
+            continue
+        value_f = float(value)
+        if value_f > 0.0:
+            lookup[ts] = value_f
+    return lookup
 
 
 def _normalize_reward_name(value: Any, *, role: str, allowed: Iterable[str]) -> str:
@@ -636,6 +683,8 @@ def append_replay_event(
                     "entry_time": trade.entry_time,
                     "highest_price": trade.highest_price,
                     "lowest_price": trade.lowest_price,
+                    "trailing_stop_price": trade.trailing_stop_price,
+                    "take_profit_price": trade.take_profit_price,
                 }
                 for ticker, trade in active_trades.items()
             },
@@ -1008,18 +1057,42 @@ def _generate_replay_memory(
     evaluation_days = int(config.get("evaluation_days_num", 0))
     safe_start_time = datetime.strptime(config.get("safe_start_time"), "%H:%M").time()
     safe_end_time = datetime.strptime(config.get("safe_end_time"), "%H:%M").time()
-    trailing_stop_key = (
-        "training_trailing_stop_loss_pct" if mode == "training" else "evaluation_trailing_stop_loss_pct"
+    trailing_stop_atr_period_key = (
+        "training_trailing_stop_atr_period"
+        if mode == "training"
+        else "evaluation_trailing_stop_atr_period"
     )
-    trailing_stop = float(config.get(trailing_stop_key))
-    take_profit_key = (
-        "training_take_profit_pct" if mode == "training" else "evaluation_take_profit_pct"
+    trailing_stop_atr_multiplier_key = (
+        "training_trailing_stop_atr_multiplier"
+        if mode == "training"
+        else "evaluation_trailing_stop_atr_multiplier"
     )
-    take_profit = float(config.get(take_profit_key))
+    trailing_stop_atr_period = int(config.get(trailing_stop_atr_period_key, 14))
+    trailing_stop_atr_multiplier = float(config.get(trailing_stop_atr_multiplier_key, 2.0))
+    if trailing_stop_atr_period <= 0:
+        raise ValueError(f"{trailing_stop_atr_period_key} must be > 0.")
+    if trailing_stop_atr_multiplier <= 0:
+        raise ValueError(f"{trailing_stop_atr_multiplier_key} must be > 0.")
+    atr_period_key = (
+        "training_take_profit_atr_period"
+        if mode == "training"
+        else "evaluation_take_profit_atr_period"
+    )
+    atr_multiplier_key = (
+        "training_take_profit_atr_multiplier"
+        if mode == "training"
+        else "evaluation_take_profit_atr_multiplier"
+    )
+    take_profit_atr_period = int(config.get(atr_period_key, 14))
+    take_profit_atr_multiplier = float(config.get(atr_multiplier_key, 2.0))
+    if take_profit_atr_period <= 0:
+        raise ValueError(f"{atr_period_key} must be > 0.")
+    if take_profit_atr_multiplier <= 0:
+        raise ValueError(f"{atr_multiplier_key} must be > 0.")
     if override_trailing_stop is not None:
-        trailing_stop = float(override_trailing_stop)
+        trailing_stop_atr_multiplier = float(override_trailing_stop)
     if override_take_profit is not None:
-        take_profit = float(override_take_profit)
+        take_profit_atr_multiplier = float(override_take_profit)
     max_concurrent_trades = int(config.get("max_concurrent_trades"))
     capital_per_ticker = float(config.get("capital_per_ticker"))
     leverage = float(config.get("leverage"))
@@ -1068,10 +1141,16 @@ def _generate_replay_memory(
                     ckpt_name,
                 )
             )
+            trailing_stop_desc = (
+                f"atr(period={trailing_stop_atr_period},mult={trailing_stop_atr_multiplier:.4f})"
+            )
+            take_profit_desc = (
+                f"atr(period={take_profit_atr_period},mult={take_profit_atr_multiplier:.4f})"
+            )
             print(
                 f"[config:reward] reward_fn={rl_reward_fn} | "
-                f"trailing_stop={trailing_stop:.4f} | "
-                f"take_profit={take_profit:.4f} | "
+                f"trailing_stop={trailing_stop_desc} | "
+                f"take_profit={take_profit_desc} | "
                 f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
                 f"shorting_allowed={'short' in trade_status_list} | "
                 f"cost_exchange={cost_exchange}"
@@ -1126,6 +1205,31 @@ def _generate_replay_memory(
     decision_positions = {
         ticker: compute_day_positions(decision_data[ticker]) for ticker in tickers
     }
+    trailing_atr_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
+    trailing_atr_lookup = {
+        ticker: build_atr_lookup(decision_data[ticker], trailing_stop_atr_period)
+        for ticker in tickers
+    }
+    if verbose:
+        missing_atr = [ticker for ticker, lookup in trailing_atr_lookup.items() if not lookup]
+        if missing_atr:
+            print(
+                f"[replay:{mode}] Warning: trailing-stop ATR unavailable for {len(missing_atr)} ticker(s)."
+            )
+    take_profit_atr_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
+    if take_profit_atr_period == trailing_stop_atr_period:
+        take_profit_atr_lookup = trailing_atr_lookup
+    else:
+        take_profit_atr_lookup = {
+            ticker: build_atr_lookup(decision_data[ticker], take_profit_atr_period)
+            for ticker in tickers
+        }
+    if verbose:
+        missing_atr = [ticker for ticker, lookup in take_profit_atr_lookup.items() if not lookup]
+        if missing_atr:
+            print(
+                f"[replay:{mode}] Warning: take-profit ATR unavailable for {len(missing_atr)} ticker(s)."
+            )
     P_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
     range_factor_lookup: Dict[str, Dict[pd.Timestamp, float]] = {}
     P_lookup_so_far: Dict[str, Dict[pd.Timestamp, float]] = {}
@@ -1348,6 +1452,7 @@ def _generate_replay_memory(
                 if canonical:
                     reward_sum_by_action[canonical] += reward_val
                     reward_sq_by_action[canonical] += reward_val * reward_val
+                    reward_cnt_by_action[canonical] += 1
                     if reward_val < 0:
                         reward_neg_by_action[canonical] += 1
 
@@ -1603,6 +1708,8 @@ def _generate_replay_memory(
         percent_pnl_snapshot: Dict[str, float] = {}
         ticker_features: Dict[str, np.ndarray] = {}
         prices: Dict[str, float] = {}
+        trailing_atr_values: Dict[str, float] = {}
+        take_profit_atr_values: Dict[str, float] = {}
 
         for ticker in tickers:
             features = build_feature_vector(
@@ -1621,6 +1728,12 @@ def _generate_replay_memory(
             price_value = price_ix[ticker].get(ts)
             if pd.notna(price_value):
                 prices[ticker] = float(price_value)
+            atr_value = trailing_atr_lookup.get(ticker, {}).get(ts)
+            if atr_value is not None and atr_value > 0:
+                trailing_atr_values[ticker] = float(atr_value)
+            atr_value = take_profit_atr_lookup.get(ticker, {}).get(ts)
+            if atr_value is not None and atr_value > 0:
+                take_profit_atr_values[ticker] = float(atr_value)
 
         if not ticker_features:
             continue
@@ -1909,11 +2022,25 @@ def _generate_replay_memory(
                 if trade.direction == status_long_label:
                     trade.highest_price = max(trade.highest_price, price)
                     trade.lowest_price = min(trade.lowest_price, price)
-                    stop_price = trade.highest_price * (1 - trailing_stop)
-                    take_profit_price = trade.entry_price * (1 + take_profit)
+                    atr_value = trailing_atr_values.get(ticker)
+                    stop_price = trade.trailing_stop_price
+                    if atr_value is not None and trailing_stop_atr_multiplier > 0.0:
+                        candidate_stop = trade.highest_price - (trailing_stop_atr_multiplier * atr_value)
+                        stop_price = (
+                            max(stop_price, candidate_stop)
+                            if stop_price is not None
+                            else candidate_stop
+                        )
+                        trade.trailing_stop_price = stop_price
+                    take_profit_price = trade.take_profit_price
+                    if take_profit_price is None:
+                        atr_value = take_profit_atr_values.get(ticker)
+                        if atr_value is not None:
+                            take_profit_price = trade.entry_price + (take_profit_atr_multiplier * atr_value)
+                            trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == sell_idx
-                    exit_take_profit = price >= take_profit_price
-                    exit_trailing = price <= stop_price
+                    exit_take_profit = take_profit_price is not None and price >= take_profit_price
+                    exit_trailing = stop_price is not None and price <= stop_price
                     if exit_signal or exit_take_profit or exit_trailing:
                         reason = (
                             "signal"
@@ -1955,11 +2082,25 @@ def _generate_replay_memory(
                 elif trade.direction == status_short_label:
                     trade.lowest_price = min(trade.lowest_price, price)
                     trade.highest_price = max(trade.highest_price, price)
-                    stop_price = trade.lowest_price * (1 + trailing_stop)
-                    take_profit_price = trade.entry_price * (1 - take_profit)
+                    atr_value = trailing_atr_values.get(ticker)
+                    stop_price = trade.trailing_stop_price
+                    if atr_value is not None and trailing_stop_atr_multiplier > 0.0:
+                        candidate_stop = trade.lowest_price + (trailing_stop_atr_multiplier * atr_value)
+                        stop_price = (
+                            min(stop_price, candidate_stop)
+                            if stop_price is not None
+                            else candidate_stop
+                        )
+                        trade.trailing_stop_price = stop_price
+                    take_profit_price = trade.take_profit_price
+                    if take_profit_price is None:
+                        atr_value = take_profit_atr_values.get(ticker)
+                        if atr_value is not None:
+                            take_profit_price = trade.entry_price - (take_profit_atr_multiplier * atr_value)
+                            trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == buy_idx
-                    exit_take_profit = price <= take_profit_price
-                    exit_trailing = price >= stop_price
+                    exit_take_profit = take_profit_price is not None and price <= take_profit_price
+                    exit_trailing = stop_price is not None and price >= stop_price
                     if exit_signal or exit_take_profit or exit_trailing:
                         reason = (
                             "signal"
@@ -2027,6 +2168,23 @@ def _generate_replay_memory(
             if quantity <= 0:
                 continue
 
+            initial_stop_price: Optional[float]
+            initial_take_profit_price: Optional[float]
+            if direction == status_long_label:
+                trailing_atr_value = trailing_atr_values.get(ticker)
+                take_profit_atr_value = take_profit_atr_values.get(ticker)
+                if trailing_atr_value is None or take_profit_atr_value is None:
+                    continue
+                initial_stop_price = price - (trailing_stop_atr_multiplier * trailing_atr_value)
+                initial_take_profit_price = price + (take_profit_atr_multiplier * take_profit_atr_value)
+            else:
+                trailing_atr_value = trailing_atr_values.get(ticker)
+                take_profit_atr_value = take_profit_atr_values.get(ticker)
+                if trailing_atr_value is None or take_profit_atr_value is None:
+                    continue
+                initial_stop_price = price + (trailing_stop_atr_multiplier * trailing_atr_value)
+                initial_take_profit_price = price - (take_profit_atr_multiplier * take_profit_atr_value)
+
             active_trades[ticker] = Trade(
                 ticker=ticker,
                 direction=direction,
@@ -2035,6 +2193,8 @@ def _generate_replay_memory(
                 entry_time=ts.isoformat(),
                 highest_price=price,
                 lowest_price=price,
+                trailing_stop_price=initial_stop_price,
+                take_profit_price=initial_take_profit_price,
             )
             trade_status_key = status_long_label if direction == status_long_label else status_short_label
             trade_status_indices[ticker] = trade_status_map.get(trade_status_key, flat_status_idx)
@@ -2302,7 +2462,7 @@ def _generate_replay_memory(
             no_op_rate = 1.0 - (executed_total / max(chosen_total, 1))
             print(
                 f"[diag:action_exec] chosen={chosen_total} legal={legal_decisions} "
-                f"executed={executed_total} no_op_rate={no_op_rate:.2f}"
+                f"executed={executed_total} no_op_rate={no_op_rate:.4f}"
             )
             def _mix(mix_counts: Dict[str, int]) -> str:
                 tot = sum(mix_counts.values()) or 1

@@ -1,4 +1,4 @@
-"""Tune the evaluation trailing stop loss percentage using replay evaluation."""
+"""Tune the evaluation trailing stop ATR multiplier using replay evaluation."""
 
 from __future__ import annotations
 
@@ -10,23 +10,20 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from replay import CONFIG_PATH, load_config, populate_evaluation_replay_memory
 
-# Default search space if config does not define one.
-DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
+DEFAULT_CANDIDATES: List[float] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
 DEFAULT_METRIC = "pnl_tstat"
 
 
 def _write_config(config: Dict[str, Any], path: Path, verbose: bool) -> None:
-    """Persist the provided configuration to disk."""
     serialized = json.dumps(config, indent=2)
     path.write_text(serialized + "\n", encoding="utf-8")
     if verbose:
-        ts_val = config.get("evaluation_trailing_stop_loss_pct")
+        ts_val = config.get("evaluation_trailing_stop_atr_multiplier")
         trailing_stop = f"{float(ts_val):.4f}" if isinstance(ts_val, (float, int)) else "n/a"
-        print(f"[tune] Wrote config to {path} with evaluation_trailing_stop_loss_pct={trailing_stop}")
+        print(f"[tune] Wrote config to {path} with evaluation_trailing_stop_atr_multiplier={trailing_stop}")
 
 
 def _score_summary(summary: Dict[str, Any], metric: str) -> float:
-    """Extract a numeric score from replay summary."""
     value = summary.get(metric)
     if value is None:
         return float("-inf")
@@ -53,7 +50,7 @@ def _parse_candidates(raw: str | None, config: Dict[str, Any]) -> List[float]:
         candidates = [float(p) for p in parts]
     else:
         tuning_cfg = config.get("tuning", {})
-        candidates = [float(v) for v in tuning_cfg.get("trailing_stop_candidates", DEFAULT_CANDIDATES)]
+        candidates = [float(v) for v in tuning_cfg.get("trailing_stop_atr_multiplier_candidates", DEFAULT_CANDIDATES)]
     return _dedupe_preserve_order(candidates)
 
 
@@ -75,9 +72,9 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
 
     base_config = load_config(CONFIG_PATH)
     original_config = copy.deepcopy(base_config)
-    training_tp_raw = base_config.get("training_take_profit_pct")
+    training_tp_raw = base_config.get("training_take_profit_atr_multiplier")
     if training_tp_raw is None:
-        raise ValueError("Config must define 'training_take_profit_pct' for trailing stop tuning.")
+        raise ValueError("Config must define 'training_take_profit_atr_multiplier' for trailing stop tuning.")
     training_take_profit = float(training_tp_raw)
     best_value = None
     best_score = float("-inf")
@@ -86,16 +83,20 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
 
     if verbose:
         joined = ", ".join(f"{c:.4f}" for c in candidates)
-        print(f"[tune] Evaluating {len(candidates)} trailing stop values: [{joined}] using metric '{metric}'")
-        print(f"[tune] Fixed evaluation_take_profit_pct={training_take_profit:.4f} (from training_take_profit_pct)")
+        print(f"[tune] Evaluating {len(candidates)} trailing stop multipliers: [{joined}] using metric '{metric}'")
+        print(
+            f"[tune] Fixed evaluation_take_profit_atr_multiplier={training_take_profit:.4f} "
+            "(from training_take_profit_atr_multiplier)"
+        )
 
     try:
         for idx, candidate in enumerate(candidates, start=1):
             if verbose:
-                print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with trailing_stop={candidate:.4f}")
+                print(f"[tune] ({idx}/{len(candidates)}) Running evaluation with trailing_stop_mult={candidate:.4f}")
 
             summary = populate_evaluation_replay_memory(
                 verbose=verbose,
+                override_trailing_stop=candidate,
                 override_take_profit=training_take_profit,
             )
             score = _score_summary(summary, metric)
@@ -105,7 +106,7 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
                 pnl = summary.get("avg_pct_pnl")
                 pnl_str = f"{pnl:.4f}%" if isinstance(pnl, (float, int)) and pnl is not None else "n/a"
                 print(
-                    f"[tune] completed trailing_stop={candidate:.4f} | "
+                    f"[tune] completed trailing_stop_mult={candidate:.4f} | "
                     f"{metric}={score:.4f} | avg_pct_pnl={pnl_str}"
                 )
 
@@ -117,15 +118,15 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
         raise
 
     if best_value is None:
-        raise RuntimeError("Unable to determine best trailing stop value; all candidates failed.")
+        raise RuntimeError("Unable to determine best trailing stop multiplier; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)
-    final_config["evaluation_trailing_stop_loss_pct"] = best_value
+    final_config["evaluation_trailing_stop_atr_multiplier"] = best_value
     _write_config(final_config, CONFIG_PATH, verbose=verbose)
 
     if verbose:
         print(
-            f"[tune] Best trailing stop={best_value:.4f} with {metric}={best_score:.4f}; "
+            f"[tune] Best trailing stop multiplier={best_value:.4f} with {metric}={best_score:.4f}; "
             f"config updated at {CONFIG_PATH}"
         )
         print(
@@ -138,19 +139,22 @@ def tune_trailing_stop_loss(candidates: List[float], metric: str, verbose: bool)
             marker = "<- best" if val == best_value else ""
             print(f"  {val:.4f}: {score:.4f} {marker}")
     else:
-        print(f"Updated evaluation_trailing_stop_loss_pct to {best_value:.4f} (metric '{metric}'={best_score:.4f})")
+        print(
+            f"Updated evaluation_trailing_stop_atr_multiplier to {best_value:.4f} "
+            f"(metric '{metric}'={best_score:.4f})"
+        )
 
     return best_value, best_summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tune evaluation trailing stop loss percentage and update config.json.",
+        description="Tune evaluation trailing stop ATR multiplier and update config.json.",
     )
     parser.add_argument(
         "--candidates",
         type=str,
-        help="Comma-separated trailing stop pct values to evaluate. Example: 0.005,0.01,0.02",
+        help="Comma-separated trailing stop ATR multipliers to evaluate. Example: 1.0,1.5,2.0",
     )
     parser.add_argument(
         "--metric",

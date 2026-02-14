@@ -1,4 +1,4 @@
-"""Tune evaluation take profit and trailing stop loss percentages using replay evaluation."""
+"""Tune evaluation ATR take profit and trailing stop multipliers using replay evaluation."""
 
 from __future__ import annotations
 
@@ -11,8 +11,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from replay import CONFIG_PATH, load_config, populate_evaluation_replay_memory
 
-# Default search space if config does not define one.
-DEFAULT_CANDIDATES: List[float] = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
+DEFAULT_ATR_MULTIPLIER_CANDIDATES: List[float] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
 DEFAULT_METRIC = "pnl_tstat"
 
 
@@ -21,14 +20,14 @@ def _write_config(config: Dict[str, Any], path: Path, verbose: bool, quiet: bool
     serialized = json.dumps(config, indent=2)
     path.write_text(serialized + "\n", encoding="utf-8")
     if verbose and not quiet:
-        ts_val = config.get("evaluation_trailing_stop_loss_pct")
-        tp_val = config.get("evaluation_take_profit_pct")
+        ts_val = config.get("evaluation_trailing_stop_atr_multiplier")
+        tp_val = config.get("evaluation_take_profit_atr_multiplier")
         trailing_stop = f"{float(ts_val):.4f}" if isinstance(ts_val, (float, int)) else "n/a"
         take_profit = f"{float(tp_val):.4f}" if isinstance(tp_val, (float, int)) else "n/a"
         print(
             f"[tune] Wrote config to {path} with "
-            f"evaluation_trailing_stop_loss_pct={trailing_stop} "
-            f"evaluation_take_profit_pct={take_profit}"
+            f"evaluation_trailing_stop_atr_multiplier={trailing_stop} "
+            f"evaluation_take_profit_atr_multiplier={take_profit}"
         )
 
 
@@ -60,7 +59,7 @@ def _parse_candidates(raw: str | None, config: Dict[str, Any], key: str) -> List
         candidates = [float(p) for p in parts]
     else:
         tuning_cfg = config.get("tuning", {})
-        candidates = [float(v) for v in tuning_cfg.get(key, DEFAULT_CANDIDATES)]
+        candidates = [float(v) for v in tuning_cfg.get(key, DEFAULT_ATR_MULTIPLIER_CANDIDATES)]
     return _dedupe_preserve_order(candidates)
 
 
@@ -112,11 +111,10 @@ def tune_take_profit_and_trailing_stop_loss(
         trailing_joined = ", ".join(f"{c:.4f}" for c in trailing_candidates)
         take_profit_joined = ", ".join(f"{c:.4f}" for c in take_profit_candidates)
         print(f"[tune] Evaluating {total} combinations using metric '{metric}'")
-        print(f"[tune] Trailing stop candidates ({len(trailing_candidates)}): [{trailing_joined}]")
-        print(f"[tune] Take profit candidates ({len(take_profit_candidates)}): [{take_profit_joined}]")
+        print(f"[tune] Trailing stop multiplier candidates ({len(trailing_candidates)}): [{trailing_joined}]")
+        print(f"[tune] Take profit multiplier candidates ({len(take_profit_candidates)}): [{take_profit_joined}]")
 
     try:
-        # Iterate through the full grid of candidate pairs.
         for idx, (trailing_stop, take_profit) in enumerate(
             product(trailing_candidates, take_profit_candidates),
             start=1,
@@ -124,7 +122,7 @@ def tune_take_profit_and_trailing_stop_loss(
             if verbose and not quiet:
                 print(
                     f"[tune] ({idx}/{total}) Running evaluation with "
-                    f"trailing_stop={trailing_stop:.4f}, take_profit={take_profit:.4f}"
+                    f"trailing_stop_mult={trailing_stop:.4f}, take_profit_mult={take_profit:.4f}"
                 )
 
             summary = populate_evaluation_replay_memory(
@@ -139,8 +137,8 @@ def tune_take_profit_and_trailing_stop_loss(
                 pnl = summary.get("avg_pct_pnl")
                 pnl_str = f"{pnl:.4f}%" if isinstance(pnl, (float, int)) and pnl is not None else "n/a"
                 print(
-                    f"[tune] completed trailing_stop={trailing_stop:.4f}, take_profit={take_profit:.4f} | "
-                    f"{metric}={score:.4f} | avg_pct_pnl={pnl_str}"
+                    f"[tune] completed trailing_stop_mult={trailing_stop:.4f}, "
+                    f"take_profit_mult={take_profit:.4f} | {metric}={score:.4f} | avg_pct_pnl={pnl_str}"
                 )
 
             if score > best_score:
@@ -154,13 +152,13 @@ def tune_take_profit_and_trailing_stop_loss(
         raise RuntimeError("Unable to determine best take profit + trailing stop pair; all candidates failed.")
 
     final_config = copy.deepcopy(original_config)
-    final_config["evaluation_trailing_stop_loss_pct"] = best_pair[0]
-    final_config["evaluation_take_profit_pct"] = best_pair[1]
+    final_config["evaluation_trailing_stop_atr_multiplier"] = best_pair[0]
+    final_config["evaluation_take_profit_atr_multiplier"] = best_pair[1]
     _write_config(final_config, CONFIG_PATH, verbose=verbose, quiet=quiet)
 
     if verbose and not quiet:
         print(
-            f"[tune] Best pair trailing_stop={best_pair[0]:.4f}, take_profit={best_pair[1]:.4f} "
+            f"[tune] Best pair trailing_stop_mult={best_pair[0]:.4f}, take_profit_mult={best_pair[1]:.4f} "
             f"with {metric}={best_score:.4f}; config updated at {CONFIG_PATH}"
         )
         print(
@@ -172,12 +170,13 @@ def tune_take_profit_and_trailing_stop_loss(
         for trailing_stop, take_profit, score in results:
             marker = "<- best" if (trailing_stop, take_profit) == best_pair else ""
             print(
-                f"  trailing_stop={trailing_stop:.4f}, take_profit={take_profit:.4f}: {score:.4f} {marker}"
+                f"  trailing_stop_mult={trailing_stop:.4f}, "
+                f"take_profit_mult={take_profit:.4f}: {score:.4f} {marker}"
             )
     elif not quiet:
         print(
-            f"Updated evaluation_trailing_stop_loss_pct to {best_pair[0]:.4f} and "
-            f"evaluation_take_profit_pct to {best_pair[1]:.4f} (metric '{metric}'={best_score:.4f})"
+            f"Updated evaluation_trailing_stop_atr_multiplier to {best_pair[0]:.4f} and "
+            f"evaluation_take_profit_atr_multiplier to {best_pair[1]:.4f} (metric '{metric}'={best_score:.4f})"
         )
 
     return best_pair, best_summary
@@ -185,17 +184,17 @@ def tune_take_profit_and_trailing_stop_loss(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tune evaluation take profit and trailing stop loss percentages and update config.json.",
+        description="Tune evaluation ATR take profit and trailing stop multipliers and update config.json.",
     )
     parser.add_argument(
         "--trailing-stop-candidates",
         type=str,
-        help="Comma-separated trailing stop pct values to evaluate. Example: 0.005,0.01,0.02",
+        help="Comma-separated trailing stop ATR multipliers to evaluate. Example: 1.0,1.5,2.0",
     )
     parser.add_argument(
         "--take-profit-candidates",
         type=str,
-        help="Comma-separated take profit pct values to evaluate. Example: 0.005,0.01,0.02",
+        help="Comma-separated take profit ATR multipliers to evaluate. Example: 1.0,1.5,2.0",
     )
     parser.add_argument(
         "--metric",
@@ -219,12 +218,12 @@ def main(argv: List[str] | None = None) -> int:
         trailing_candidates = _parse_candidates(
             args.trailing_stop_candidates,
             config,
-            "trailing_stop_candidates",
+            "trailing_stop_atr_multiplier_candidates",
         )
         take_profit_candidates = _parse_candidates(
             args.take_profit_candidates,
             config,
-            "take_profit_candidates",
+            "take_profit_atr_multiplier_candidates",
         )
         tune_take_profit_and_trailing_stop_loss(
             trailing_candidates,

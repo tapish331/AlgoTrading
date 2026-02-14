@@ -305,6 +305,34 @@ def _extract_latest_prices(
     return prices
 
 
+def _latest_atr_value(decision_df: pd.DataFrame, period: int) -> Optional[float]:
+    if period <= 0 or decision_df.empty:
+        return None
+    required = {"high", "low", "close"}
+    if any(col not in decision_df.columns for col in required):
+        return None
+    high = pd.to_numeric(decision_df["high"], errors="coerce")
+    low = pd.to_numeric(decision_df["low"], errors="coerce")
+    close = pd.to_numeric(decision_df["close"], errors="coerce")
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=(1.0 / period), adjust=False, min_periods=period).mean()
+    if atr.empty:
+        return None
+    value = atr.iloc[-1]
+    if pd.isna(value):
+        return None
+    value_f = float(value)
+    return value_f if value_f > 0.0 else None
+
+
 def _print_active_trades_summary(
     active_trades: Dict[str, Trade],
     prices: Dict[str, float],
@@ -363,6 +391,8 @@ def _persist_active_trades_state(
                 "lowest_price": trade.lowest_price,
                 "highest_price_at": trade.highest_price_time,
                 "lowest_price_at": trade.lowest_price_time,
+                "trailing_stop_price": trade.trailing_stop_price,
+                "take_profit_price": trade.take_profit_price,
                 "current_price": (current_prices or {}).get(ticker),
                 "current_percent_pnl": (current_pnls or {}).get(ticker),
                 "data_timestamp": trade.data_timestamp,
@@ -489,6 +519,16 @@ def _load_active_trades_state(
                 lowest_price=float(raw.get("lowest_price", raw["entry_price"])),
                 highest_price_time=raw.get("highest_price_at"),
                 lowest_price_time=raw.get("lowest_price_at"),
+                trailing_stop_price=(
+                    float(raw["trailing_stop_price"])
+                    if raw.get("trailing_stop_price") is not None
+                    else None
+                ),
+                take_profit_price=(
+                    float(raw["take_profit_price"])
+                    if raw.get("take_profit_price") is not None
+                    else None
+                ),
                 data_timestamp=str(data_ts) if data_ts not in (None, "") else None,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -601,6 +641,8 @@ def _sync_trades_with_broker(
                 lowest_price=lowest_price,
                 highest_price_time=now_iso,
                 lowest_price_time=now_iso,
+                trailing_stop_price=None,
+                take_profit_price=None,
                 data_timestamp=now_iso,
             )
             mutated = True
@@ -614,12 +656,16 @@ def _sync_trades_with_broker(
         changed = False
         if trade.direction != direction_label:
             trade.direction = direction_label
+            trade.trailing_stop_price = None
+            trade.take_profit_price = None
             changed = True
         if trade.quantity != quantity:
             trade.quantity = quantity
             changed = True
         if abs(trade.entry_price - entry_price) > 1e-6:
             trade.entry_price = entry_price
+            trade.trailing_stop_price = None
+            trade.take_profit_price = None
             changed = True
         if not trade.entry_time:
             trade.entry_time = entry_time
@@ -827,8 +873,23 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("decision_interval must be one of the configured timeframes")
 
     lookback = int(config.get("train", {}).get("lookback", 1))
-    trailing_stop = float(config.get("evaluation_trailing_stop_loss_pct", 0.0))
-    take_profit = float(config.get("evaluation_take_profit_pct", 0.0))
+    trailing_stop_atr_multiplier = float(config.get("evaluation_trailing_stop_atr_multiplier", 2.0))
+    atr_period = int(config.get("evaluation_trailing_stop_atr_period", 14))
+    atr_multiplier = trailing_stop_atr_multiplier
+    if atr_period <= 0:
+        raise ValueError("evaluation_trailing_stop_atr_period must be > 0.")
+    if atr_multiplier <= 0:
+        raise ValueError("evaluation_trailing_stop_atr_multiplier must be > 0.")
+    take_profit_atr_period = int(config.get("evaluation_take_profit_atr_period", 14))
+    take_profit_atr_multiplier = float(config.get("evaluation_take_profit_atr_multiplier", 2.0))
+    if take_profit_atr_period <= 0:
+        raise ValueError("evaluation_take_profit_atr_period must be > 0.")
+    if take_profit_atr_multiplier <= 0:
+        raise ValueError("evaluation_take_profit_atr_multiplier must be > 0.")
+    atr_lookback_needed = lookback
+    atr_lookback_needed = max(atr_lookback_needed, atr_period + 2)
+    atr_lookback_needed = max(atr_lookback_needed, take_profit_atr_period + 2)
+    snapshot_lookback = atr_lookback_needed
     max_concurrent = int(config.get("max_concurrent_trades", 1))
     capital_per_ticker = float(config.get("capital_per_ticker", 0.0))
     leverage = float(config.get("leverage", 1.0))
@@ -919,9 +980,12 @@ def run(args: argparse.Namespace) -> None:
     hard_cutoff = datetime.combine(today, hard_end_time, tzinfo=INDIA_TZ)
 
     if args.verbose:
+        trailing_stop_desc = f"atr(period={atr_period},mult={atr_multiplier:.4f})"
+        take_profit_desc = f"atr(period={take_profit_atr_period},mult={take_profit_atr_multiplier:.4f})"
         print(
             f"[trade] Starting live loop | mode={mode} safe_window={safe_start_time}-{safe_end_time} "
-            f"hard_end={hard_end_time} poll={poll_seconds:.1f}s"
+            f"hard_end={hard_end_time} poll={poll_seconds:.1f}s "
+            f"trailing_stop={trailing_stop_desc} take_profit={take_profit_desc}"
         )
 
     try:
@@ -951,7 +1015,7 @@ def run(args: argparse.Namespace) -> None:
                 snapshot = fetch_market_snapshot(
                     tickers,
                     timeframes,
-                    lookback,
+                    snapshot_lookback,
                     env_path=env_path,
                     exchange=exchange,
                     verbose=args.verbose,
@@ -984,6 +1048,8 @@ def run(args: argparse.Namespace) -> None:
 
             ticker_features: Dict[str, Any] = {}
             prices: Dict[str, float] = {}
+            trailing_atr_values: Dict[str, float] = {}
+            take_profit_atr_values: Dict[str, float] = {}
             missing_feature_reasons: Dict[str, list[str]] = {}
             signal_timestamps: Dict[str, Optional[pd.Timestamp]] = {}
             for ticker in tickers:
@@ -1023,6 +1089,15 @@ def run(args: argparse.Namespace) -> None:
                     price = decision_df["close"].iloc[-1]
                     if pd.notna(price):
                         prices[ticker] = float(price)
+                        atr_value = _latest_atr_value(decision_df, atr_period)
+                        if atr_value is not None:
+                            trailing_atr_values[ticker] = atr_value
+                        if take_profit_atr_period == atr_period:
+                            atr_value = trailing_atr_values.get(ticker)
+                        else:
+                            atr_value = _latest_atr_value(decision_df, take_profit_atr_period)
+                        if atr_value is not None:
+                            take_profit_atr_values[ticker] = atr_value
                     else:
                         missing_feature_reasons.setdefault(ticker, []).append(
                             "missing close price in decision timeframe"
@@ -1119,11 +1194,25 @@ def run(args: argparse.Namespace) -> None:
                 _update_trade_extremes(trade, price, now_ist)
                 action_idx = int(inference.get(ticker, {}).get("action_idx", hold_idx))
                 if trade.direction == status_long_label:
-                    stop_price = trade.highest_price * (1 - trailing_stop)
-                    take_profit_price = trade.entry_price * (1 + take_profit)
+                    atr_value = trailing_atr_values.get(ticker)
+                    stop_price = trade.trailing_stop_price
+                    if atr_value is not None:
+                        candidate_stop = trade.highest_price - (atr_multiplier * atr_value)
+                        stop_price = (
+                            max(stop_price, candidate_stop)
+                            if stop_price is not None
+                            else candidate_stop
+                        )
+                        trade.trailing_stop_price = stop_price
+                    take_profit_price = trade.take_profit_price
+                    if take_profit_price is None:
+                        atr_value = take_profit_atr_values.get(ticker)
+                        if atr_value is not None:
+                            take_profit_price = trade.entry_price + (take_profit_atr_multiplier * atr_value)
+                            trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == sell_idx
-                    exit_take_profit = price >= take_profit_price
-                    exit_trailing = price <= stop_price
+                    exit_take_profit = take_profit_price is not None and price >= take_profit_price
+                    exit_trailing = stop_price is not None and price <= stop_price
                     should_exit = exit_signal or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
@@ -1171,11 +1260,25 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                         )
                 elif trade.direction == status_short_label:
-                    stop_price = trade.lowest_price * (1 + trailing_stop)
-                    take_profit_price = trade.entry_price * (1 - take_profit)
+                    atr_value = trailing_atr_values.get(ticker)
+                    stop_price = trade.trailing_stop_price
+                    if atr_value is not None:
+                        candidate_stop = trade.lowest_price + (atr_multiplier * atr_value)
+                        stop_price = (
+                            min(stop_price, candidate_stop)
+                            if stop_price is not None
+                            else candidate_stop
+                        )
+                        trade.trailing_stop_price = stop_price
+                    take_profit_price = trade.take_profit_price
+                    if take_profit_price is None:
+                        atr_value = take_profit_atr_values.get(ticker)
+                        if atr_value is not None:
+                            take_profit_price = trade.entry_price - (take_profit_atr_multiplier * atr_value)
+                            trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == buy_idx
-                    exit_take_profit = price <= take_profit_price
-                    exit_trailing = price >= stop_price
+                    exit_take_profit = take_profit_price is not None and price <= take_profit_price
+                    exit_trailing = stop_price is not None and price >= stop_price
                     should_exit = exit_signal or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
@@ -1266,7 +1369,15 @@ def run(args: argparse.Namespace) -> None:
                 if quantity <= 0:
                     continue
                 signal_ts = signal_timestamps.get(ticker)
+                initial_stop_price: Optional[float] = None
+                initial_take_profit_price: Optional[float] = None
                 if action_idx == buy_idx:
+                    trailing_atr = trailing_atr_values.get(ticker)
+                    take_profit_atr = take_profit_atr_values.get(ticker)
+                    if trailing_atr is None or take_profit_atr is None:
+                        continue
+                    initial_stop_price = price - (atr_multiplier * trailing_atr)
+                    initial_take_profit_price = price + (take_profit_atr_multiplier * take_profit_atr)
                     submit_market_order(
                         ticker=ticker,
                         side="buy",
@@ -1289,6 +1400,8 @@ def run(args: argparse.Namespace) -> None:
                         lowest_price=price,
                         highest_price_time=now_ist.isoformat(),
                         lowest_price_time=now_ist.isoformat(),
+                        trailing_stop_price=initial_stop_price,
+                        take_profit_price=initial_take_profit_price,
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
                     trade_status_indices[ticker] = long_status_idx
@@ -1303,6 +1416,12 @@ def run(args: argparse.Namespace) -> None:
                         verbose=args.verbose,
                     )
                 elif action_idx == sell_idx:
+                    trailing_atr = trailing_atr_values.get(ticker)
+                    take_profit_atr = take_profit_atr_values.get(ticker)
+                    if trailing_atr is None or take_profit_atr is None:
+                        continue
+                    initial_stop_price = price + (atr_multiplier * trailing_atr)
+                    initial_take_profit_price = price - (take_profit_atr_multiplier * take_profit_atr)
                     submit_market_order(
                         ticker=ticker,
                         side="sell",
@@ -1325,6 +1444,8 @@ def run(args: argparse.Namespace) -> None:
                         lowest_price=price,
                         highest_price_time=now_ist.isoformat(),
                         lowest_price_time=now_ist.isoformat(),
+                        trailing_stop_price=initial_stop_price,
+                        take_profit_price=initial_take_profit_price,
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
                     trade_status_indices[ticker] = short_status_idx
@@ -1376,7 +1497,7 @@ def run(args: argparse.Namespace) -> None:
                 snapshot = fetch_market_snapshot(
                     tickers,
                     [decision_interval],
-                    max(lookback, 2),
+                    max(snapshot_lookback, 2),
                     env_path=env_path,
                     exchange=exchange,
                     verbose=args.verbose,

@@ -69,8 +69,8 @@
     "sell"
   ],
   "reward": {
-    "rl": "proximity_cubic_range_so_far",
-    "sl": "proximity_cubic_range_so_far"
+    "rl": "trade_proximity_cubic_range",
+    "sl": "trade_proximity_cubic_range"
   },
   "training_days_num": 25,
   "evaluation_days_num": 5,
@@ -79,23 +79,27 @@
   "safe_start_time": "09:20",
   "safe_end_time": "15:15",
   "hard_end_time": "15:25",
-  "training_trailing_stop_loss_pct": 1.0,
-  "evaluation_trailing_stop_loss_pct": 0.01,
-  "training_take_profit_pct": 1.0,
-  "evaluation_take_profit_pct": 0.01,
+  "training_trailing_stop_atr_period": 5,
+  "evaluation_trailing_stop_atr_period": 5,
+  "training_take_profit_atr_period": 5,
+  "evaluation_take_profit_atr_period": 5,
+  "training_trailing_stop_atr_multiplier": 100.0,
+  "evaluation_trailing_stop_atr_multiplier": 100.0,
+  "training_take_profit_atr_multiplier": 100.0,
+  "evaluation_take_profit_atr_multiplier": 100.0,
   "tuning": {
-    "trailing_stop_candidates": [
-      0.0025,
-      0.005,
-      0.0075,
-      0.01
+    "trailing_stop_atr_multiplier_candidates": [
+      0.5,
+      1.0,
+      1.5,
+      2.0
     ],
     "trailing_stop_metric": "pnl_tstat",
-    "take_profit_candidates": [
-      0.0025,
-      0.005,
-      0.0075,
-      0.01
+    "take_profit_atr_multiplier_candidates": [
+      0.5,
+      1.0,
+      1.5,
+      2.0
     ],
     "take_profit_metric": "pnl_tstat",
     "pair_metric": "pnl_tstat"

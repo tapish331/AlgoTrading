@@ -29,6 +29,7 @@
     "JIOFIN",
     "JSWSTEEL",
     "KOTAKBANK",
+    "KWIL",
     "LT",
     "M&M",
     "MARUTI",
@@ -84,22 +85,22 @@
   "training_take_profit_atr_period": 5,
   "evaluation_take_profit_atr_period": 5,
   "training_trailing_stop_atr_multiplier": 100.0,
-  "evaluation_trailing_stop_atr_multiplier": 100.0,
+  "evaluation_trailing_stop_atr_multiplier": 2.0,
   "training_take_profit_atr_multiplier": 100.0,
-  "evaluation_take_profit_atr_multiplier": 100.0,
+  "evaluation_take_profit_atr_multiplier": 2.0,
   "tuning": {
     "trailing_stop_atr_multiplier_candidates": [
-      0.5,
-      1.0,
-      1.5,
-      2.0
+      2,
+      3,
+      4,
+      5
     ],
     "trailing_stop_metric": "pnl_tstat",
     "take_profit_atr_multiplier_candidates": [
-      0.5,
-      1.0,
-      1.5,
-      2.0
+      2,
+      3,
+      4,
+      5
     ],
     "take_profit_metric": "pnl_tstat",
     "pair_metric": "pnl_tstat"

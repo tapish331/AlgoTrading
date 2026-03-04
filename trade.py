@@ -269,6 +269,18 @@ def _update_trade_extremes(trade: Trade, price: float, timestamp: datetime) -> N
         trade.lowest_price_time = ts_iso
 
 
+def _elapsed_hold_seconds(entry_time: str, now_ist: datetime) -> float:
+    try:
+        entry_dt = datetime.fromisoformat(entry_time)
+    except ValueError:
+        return 0.0
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=INDIA_TZ)
+    else:
+        entry_dt = entry_dt.astimezone(INDIA_TZ)
+    return max((now_ist - entry_dt).total_seconds(), 0.0)
+
+
 def _parse_time(label: str, raw: Optional[str]) -> dtime:
     if not raw:
         raise ValueError(f"Missing required time configuration for '{label}'.")
@@ -910,6 +922,24 @@ def run(args: argparse.Namespace) -> None:
     sell_idx = MODEL_ACTIONS.index("sell")
     hold_idx = MODEL_ACTIONS.index("hold")
     ENTRY_CONFIRM_WINDOW = max(int(trading_cfg.get("entry_confirm_window", 3)), 1)
+    signal_exit_min_hold_seconds = max(
+        float(
+            trading_cfg.get(
+                "signal_exit_min_hold_seconds",
+                config.get("evaluation_signal_exit_min_hold_seconds", 0),
+            )
+        ),
+        0.0,
+    )
+    reentry_cooldown_seconds = max(
+        float(
+            trading_cfg.get(
+                "reentry_cooldown_seconds",
+                config.get("evaluation_reentry_cooldown_seconds", 0),
+            )
+        ),
+        0.0,
+    )
     entry_action_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
     entry_conf_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
     last_seen_signal_ts = {t: None for t in tickers}
@@ -975,6 +1005,7 @@ def run(args: argparse.Namespace) -> None:
             trade_status_indices[ticker] = short_status_idx
         else:
             trade_status_indices[ticker] = flat_status_idx
+    last_exit_time_ist: Dict[str, datetime] = {}
 
     today = datetime.now(INDIA_TZ).date()
     hard_cutoff = datetime.combine(today, hard_end_time, tzinfo=INDIA_TZ)
@@ -985,7 +1016,9 @@ def run(args: argparse.Namespace) -> None:
         print(
             f"[trade] Starting live loop | mode={mode} safe_window={safe_start_time}-{safe_end_time} "
             f"hard_end={hard_end_time} poll={poll_seconds:.1f}s "
-            f"trailing_stop={trailing_stop_desc} take_profit={take_profit_desc}"
+            f"trailing_stop={trailing_stop_desc} take_profit={take_profit_desc} "
+            f"signal_exit_min_hold={signal_exit_min_hold_seconds:.1f}s "
+            f"reentry_cooldown={reentry_cooldown_seconds:.1f}s"
         )
 
     try:
@@ -1193,6 +1226,7 @@ def run(args: argparse.Namespace) -> None:
                     continue
                 _update_trade_extremes(trade, price, now_ist)
                 action_idx = int(inference.get(ticker, {}).get("action_idx", hold_idx))
+                hold_seconds = _elapsed_hold_seconds(trade.entry_time, now_ist)
                 if trade.direction == status_long_label:
                     atr_value = trailing_atr_values.get(ticker)
                     stop_price = trade.trailing_stop_price
@@ -1211,9 +1245,16 @@ def run(args: argparse.Namespace) -> None:
                             take_profit_price = trade.entry_price + (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == sell_idx
+                    signal_exit_allowed = (
+                        exit_signal
+                        and (
+                            signal_exit_min_hold_seconds <= 0.0
+                            or hold_seconds >= signal_exit_min_hold_seconds
+                        )
+                    )
                     exit_take_profit = take_profit_price is not None and price >= take_profit_price
                     exit_trailing = stop_price is not None and price <= stop_price
-                    should_exit = exit_signal or exit_take_profit or exit_trailing
+                    should_exit = signal_exit_allowed or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -1230,7 +1271,7 @@ def run(args: argparse.Namespace) -> None:
                         pnl = compute_net_percent_pnl(True, trade.entry_price, price, trade.quantity, exchange)
                         exit_reason = (
                             "signal"
-                            if exit_signal
+                            if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
                             else "trailing_stop"
@@ -1253,6 +1294,7 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                         )
                         trade_status_indices[ticker] = flat_status_idx
+                        last_exit_time_ist[ticker] = now_ist
                         del active_trades[ticker]
                         _persist_active_trades_state(
                             ACTIVE_TRADES_PATH,
@@ -1277,9 +1319,16 @@ def run(args: argparse.Namespace) -> None:
                             take_profit_price = trade.entry_price - (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == buy_idx
+                    signal_exit_allowed = (
+                        exit_signal
+                        and (
+                            signal_exit_min_hold_seconds <= 0.0
+                            or hold_seconds >= signal_exit_min_hold_seconds
+                        )
+                    )
                     exit_take_profit = take_profit_price is not None and price <= take_profit_price
                     exit_trailing = stop_price is not None and price >= stop_price
-                    should_exit = exit_signal or exit_take_profit or exit_trailing
+                    should_exit = signal_exit_allowed or exit_take_profit or exit_trailing
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -1296,7 +1345,7 @@ def run(args: argparse.Namespace) -> None:
                         pnl = compute_net_percent_pnl(False, trade.entry_price, price, trade.quantity, exchange)
                         exit_reason = (
                             "signal"
-                            if exit_signal
+                            if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
                             else "trailing_stop"
@@ -1319,6 +1368,7 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                         )
                         trade_status_indices[ticker] = flat_status_idx
+                        last_exit_time_ist[ticker] = now_ist
                         del active_trades[ticker]
                         _persist_active_trades_state(
                             ACTIVE_TRADES_PATH,
@@ -1354,13 +1404,24 @@ def run(args: argparse.Namespace) -> None:
                 continue
 
             # Entry logic (steps 4.g and 4.h)
-            for ticker, result in inference.items():
+            for ticker, result in entry_inference.items():
                 if ticker in active_trades:
                     continue
                 if max_conf_ticker is None or ticker != max_conf_ticker:
                     continue
                 if len(active_trades) >= max_concurrent:
                     break
+                if reentry_cooldown_seconds > 0.0:
+                    last_exit = last_exit_time_ist.get(ticker)
+                    if last_exit is not None:
+                        since_exit = (now_ist - last_exit).total_seconds()
+                        if since_exit < reentry_cooldown_seconds:
+                            if args.verbose:
+                                print(
+                                    f"[trade] Skip {ticker} entry due to cooldown | "
+                                    f"elapsed={since_exit:.1f}s required={reentry_cooldown_seconds:.1f}s"
+                                )
+                            continue
                 action_idx = int(result.get("action_idx", hold_idx))
                 price = prices.get(ticker)
                 if price is None:

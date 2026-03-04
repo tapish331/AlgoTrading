@@ -502,6 +502,19 @@ def compute_min_valid_timestamp(
     return min_candidate
 
 
+def _elapsed_hold_seconds(entry_time: str, current_ts: pd.Timestamp) -> float:
+    try:
+        entry_ts = pd.to_datetime(entry_time, utc=True)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    ts = pd.Timestamp(current_ts)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return max((ts - entry_ts).total_seconds(), 0.0)
+
+
 def build_feature_vector(
     ticker: str,
     timestamp: Optional[pd.Timestamp],
@@ -1028,6 +1041,47 @@ def _generate_replay_memory(
     else:
         ENTRY_CONFIRM_WINDOW = int(config.get("evaluation_entry_confirm_window", 3))
     ENTRY_CONFIRM_WINDOW = max(ENTRY_CONFIRM_WINDOW, 1)
+    trading_cfg = config.get("trading", {}) if isinstance(config.get("trading", {}), dict) else {}
+    default_signal_exit_min_hold_seconds = float(trading_cfg.get("signal_exit_min_hold_seconds", 0))
+    default_reentry_cooldown_seconds = float(trading_cfg.get("reentry_cooldown_seconds", 0))
+    if mode == "training":
+        signal_exit_min_hold_seconds = max(
+            float(
+                config.get(
+                    "training_signal_exit_min_hold_seconds",
+                    default_signal_exit_min_hold_seconds,
+                )
+            ),
+            0.0,
+        )
+        reentry_cooldown_seconds = max(
+            float(
+                config.get(
+                    "training_reentry_cooldown_seconds",
+                    default_reentry_cooldown_seconds,
+                )
+            ),
+            0.0,
+        )
+    else:
+        signal_exit_min_hold_seconds = max(
+            float(
+                config.get(
+                    "evaluation_signal_exit_min_hold_seconds",
+                    default_signal_exit_min_hold_seconds,
+                )
+            ),
+            0.0,
+        )
+        reentry_cooldown_seconds = max(
+            float(
+                config.get(
+                    "evaluation_reentry_cooldown_seconds",
+                    default_reentry_cooldown_seconds,
+                )
+            ),
+            0.0,
+        )
     entry_action_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
     entry_conf_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
 
@@ -1152,6 +1206,8 @@ def _generate_replay_memory(
                 f"trailing_stop={trailing_stop_desc} | "
                 f"take_profit={take_profit_desc} | "
                 f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
+                f"signal_exit_min_hold={signal_exit_min_hold_seconds:.1f}s | "
+                f"reentry_cooldown={reentry_cooldown_seconds:.1f}s | "
                 f"shorting_allowed={'short' in trade_status_list} | "
                 f"cost_exchange={cost_exchange}"
             )
@@ -1315,6 +1371,7 @@ def _generate_replay_memory(
 
     trade_status_indices: Dict[str, int] = {ticker: flat_status_idx for ticker in tickers}
     active_trades: Dict[str, Trade] = {}
+    last_exit_ts_by_ticker: Dict[str, pd.Timestamp] = {}
     replay_memory: List[Dict[str, Any]] = []
 
     total_trade_status = len(trade_status_list)
@@ -1863,6 +1920,7 @@ def _generate_replay_memory(
                 _record_holding(trade, ts)
                 exited_trades.append((ticker, trade))
                 trade_status_indices[ticker] = flat_status_idx
+                last_exit_ts_by_ticker[ticker] = ts
                 del active_trades[ticker]
 
             executed_map = {
@@ -2019,6 +2077,7 @@ def _generate_replay_memory(
             action_idx = int(result["action_idx"])
 
             if trade:
+                hold_seconds = _elapsed_hold_seconds(trade.entry_time, ts)
                 if trade.direction == status_long_label:
                     trade.highest_price = max(trade.highest_price, price)
                     trade.lowest_price = min(trade.lowest_price, price)
@@ -2039,12 +2098,19 @@ def _generate_replay_memory(
                             take_profit_price = trade.entry_price + (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == sell_idx
+                    signal_exit_allowed = (
+                        exit_signal
+                        and (
+                            signal_exit_min_hold_seconds <= 0.0
+                            or hold_seconds >= signal_exit_min_hold_seconds
+                        )
+                    )
                     exit_take_profit = take_profit_price is not None and price >= take_profit_price
                     exit_trailing = stop_price is not None and price <= stop_price
-                    if exit_signal or exit_take_profit or exit_trailing:
+                    if signal_exit_allowed or exit_take_profit or exit_trailing:
                         reason = (
                             "signal"
-                            if exit_signal
+                            if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
                             else "trailing_stop"
@@ -2077,6 +2143,7 @@ def _generate_replay_memory(
                         _record_holding(trade, ts)
                         exited_trades.append((ticker, trade))
                         trade_status_indices[ticker] = flat_status_idx
+                        last_exit_ts_by_ticker[ticker] = ts
                         del active_trades[ticker]
                         continue
                 elif trade.direction == status_short_label:
@@ -2099,12 +2166,19 @@ def _generate_replay_memory(
                             take_profit_price = trade.entry_price - (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == buy_idx
+                    signal_exit_allowed = (
+                        exit_signal
+                        and (
+                            signal_exit_min_hold_seconds <= 0.0
+                            or hold_seconds >= signal_exit_min_hold_seconds
+                        )
+                    )
                     exit_take_profit = take_profit_price is not None and price <= take_profit_price
                     exit_trailing = stop_price is not None and price >= stop_price
-                    if exit_signal or exit_take_profit or exit_trailing:
+                    if signal_exit_allowed or exit_take_profit or exit_trailing:
                         reason = (
                             "signal"
-                            if exit_signal
+                            if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
                             else "trailing_stop"
@@ -2137,6 +2211,7 @@ def _generate_replay_memory(
                         _record_holding(trade, ts)
                         exited_trades.append((ticker, trade))
                         trade_status_indices[ticker] = flat_status_idx
+                        last_exit_ts_by_ticker[ticker] = ts
                         del active_trades[ticker]
                         continue
 
@@ -2146,6 +2221,12 @@ def _generate_replay_memory(
                 continue
             if ticker in active_trades:
                 continue
+            if reentry_cooldown_seconds > 0.0:
+                last_exit_ts = last_exit_ts_by_ticker.get(ticker)
+                if last_exit_ts is not None:
+                    since_exit = max((ts - last_exit_ts).total_seconds(), 0.0)
+                    if since_exit < reentry_cooldown_seconds:
+                        continue
             if mode != "training" and len(active_trades) >= max_concurrent_trades:
                 break
             if mode != "training" and max_conf_ticker is not None and ticker != max_conf_ticker:

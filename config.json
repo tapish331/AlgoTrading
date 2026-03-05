@@ -78,6 +78,8 @@
   "evaluation_entry_confirm_window": 3,
   "training_signal_exit_min_hold_seconds": 90,
   "evaluation_signal_exit_min_hold_seconds": 90,
+  "training_signal_exit_cost_floor_pct": null,
+  "evaluation_signal_exit_cost_floor_pct": null,
   "training_reentry_cooldown_seconds": 120,
   "evaluation_reentry_cooldown_seconds": 120,
   "safe_start_time": "09:20",
@@ -88,7 +90,7 @@
   "training_take_profit_atr_period": 5,
   "evaluation_take_profit_atr_period": 5,
   "training_trailing_stop_atr_multiplier": 100.0,
-  "evaluation_trailing_stop_atr_multiplier": 7.0,
+  "evaluation_trailing_stop_atr_multiplier": 9.0,
   "training_take_profit_atr_multiplier": 100.0,
   "evaluation_take_profit_atr_multiplier": 3.0,
   "tuning": {
@@ -116,6 +118,7 @@
     "poll_interval_seconds": 1,
     "entry_confirm_window": 3,
     "signal_exit_min_hold_seconds": 90,
+    "signal_exit_cost_floor_pct": null,
     "reentry_cooldown_seconds": 120
   },
   "logging": {

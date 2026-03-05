@@ -29,7 +29,9 @@ from replay import (
     compute_day_positions,
     compute_input_dim,
     compute_net_percent_pnl,
+    compute_percent_pnl,
     compute_quantity,
+    estimate_roundtrip_cost_pct,
     infer_actions,
     load_config,
 )
@@ -285,6 +287,18 @@ def _parse_time(label: str, raw: Optional[str]) -> dtime:
     if not raw:
         raise ValueError(f"Missing required time configuration for '{label}'.")
     return datetime.strptime(raw, "%H:%M").time()
+
+
+def _parse_optional_non_negative_float(label: str, raw: Any) -> Optional[float]:
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a non-negative number when provided.") from exc
+    if value < 0:
+        raise ValueError(f"{label} must be >= 0 when provided.")
+    return value
 
 
 def _build_history_frames(snapshot: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, pd.DataFrame]]:
@@ -931,6 +945,13 @@ def run(args: argparse.Namespace) -> None:
         ),
         0.0,
     )
+    signal_exit_cost_floor_pct = _parse_optional_non_negative_float(
+        "signal_exit_cost_floor_pct",
+        trading_cfg.get(
+            "signal_exit_cost_floor_pct",
+            config.get("evaluation_signal_exit_cost_floor_pct"),
+        ),
+    )
     reentry_cooldown_seconds = max(
         float(
             trading_cfg.get(
@@ -1013,11 +1034,17 @@ def run(args: argparse.Namespace) -> None:
     if args.verbose:
         trailing_stop_desc = f"atr(period={atr_period},mult={atr_multiplier:.4f})"
         take_profit_desc = f"atr(period={take_profit_atr_period},mult={take_profit_atr_multiplier:.4f})"
+        signal_exit_cost_floor_desc = (
+            f"{signal_exit_cost_floor_pct:.4f}%"
+            if signal_exit_cost_floor_pct is not None
+            else "auto(roundtrip_cost)"
+        )
         print(
             f"[trade] Starting live loop | mode={mode} safe_window={safe_start_time}-{safe_end_time} "
             f"hard_end={hard_end_time} poll={poll_seconds:.1f}s "
             f"trailing_stop={trailing_stop_desc} take_profit={take_profit_desc} "
             f"signal_exit_min_hold={signal_exit_min_hold_seconds:.1f}s "
+            f"signal_exit_cost_floor={signal_exit_cost_floor_desc} "
             f"reentry_cooldown={reentry_cooldown_seconds:.1f}s"
         )
 
@@ -1245,12 +1272,26 @@ def run(args: argparse.Namespace) -> None:
                             take_profit_price = trade.entry_price + (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == sell_idx
+                    gross_pct_now = compute_percent_pnl(True, trade.entry_price, price)
+                    effective_signal_exit_cost_floor = signal_exit_cost_floor_pct
+                    if effective_signal_exit_cost_floor is None:
+                        effective_signal_exit_cost_floor = estimate_roundtrip_cost_pct(
+                            trade.entry_price,
+                            trade.quantity,
+                            True,
+                            exchange,
+                        )
+                    signal_exit_cost_floor_ok = (
+                        gross_pct_now < 0.0
+                        or gross_pct_now >= effective_signal_exit_cost_floor
+                    )
                     signal_exit_allowed = (
                         exit_signal
                         and (
                             signal_exit_min_hold_seconds <= 0.0
                             or hold_seconds >= signal_exit_min_hold_seconds
                         )
+                        and signal_exit_cost_floor_ok
                     )
                     exit_take_profit = take_profit_price is not None and price >= take_profit_price
                     exit_trailing = stop_price is not None and price <= stop_price
@@ -1319,12 +1360,26 @@ def run(args: argparse.Namespace) -> None:
                             take_profit_price = trade.entry_price - (take_profit_atr_multiplier * atr_value)
                             trade.take_profit_price = take_profit_price
                     exit_signal = action_idx == buy_idx
+                    gross_pct_now = compute_percent_pnl(False, trade.entry_price, price)
+                    effective_signal_exit_cost_floor = signal_exit_cost_floor_pct
+                    if effective_signal_exit_cost_floor is None:
+                        effective_signal_exit_cost_floor = estimate_roundtrip_cost_pct(
+                            trade.entry_price,
+                            trade.quantity,
+                            False,
+                            exchange,
+                        )
+                    signal_exit_cost_floor_ok = (
+                        gross_pct_now < 0.0
+                        or gross_pct_now >= effective_signal_exit_cost_floor
+                    )
                     signal_exit_allowed = (
                         exit_signal
                         and (
                             signal_exit_min_hold_seconds <= 0.0
                             or hold_seconds >= signal_exit_min_hold_seconds
                         )
+                        and signal_exit_cost_floor_ok
                     )
                     exit_take_profit = take_profit_price is not None and price <= take_profit_price
                     exit_trailing = stop_price is not None and price >= stop_price

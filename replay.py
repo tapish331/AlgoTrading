@@ -1113,6 +1113,20 @@ def _generate_replay_memory(
             ) from exc
         if signal_exit_cost_floor_pct < 0:
             raise ValueError(f"{signal_exit_cost_floor_pct_key} must be >= 0 when provided.")
+    max_open_loss_pct_key = (
+        "training_max_open_loss_pct"
+        if mode == "training"
+        else "evaluation_max_open_loss_pct"
+    )
+    raw_max_open_loss_pct = config.get(max_open_loss_pct_key)
+    max_open_loss_pct: Optional[float] = None
+    if raw_max_open_loss_pct is not None:
+        try:
+            max_open_loss_pct = float(raw_max_open_loss_pct)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{max_open_loss_pct_key} must be a non-negative number when provided.") from exc
+        if max_open_loss_pct < 0:
+            raise ValueError(f"{max_open_loss_pct_key} must be >= 0 when provided.")
     entry_action_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
     entry_conf_hist = {t: deque(maxlen=ENTRY_CONFIRM_WINDOW) for t in tickers}
 
@@ -1237,6 +1251,11 @@ def _generate_replay_memory(
                 if signal_exit_cost_floor_pct is not None
                 else "auto(roundtrip_cost)"
             )
+            max_open_loss_desc = (
+                f"{max_open_loss_pct:.4f}%"
+                if max_open_loss_pct is not None
+                else "disabled"
+            )
             print(
                 f"[config:reward] reward_fn={rl_reward_fn} | "
                 f"trailing_stop={trailing_stop_desc} | "
@@ -1244,6 +1263,7 @@ def _generate_replay_memory(
                 f"safe_window={safe_start_time.strftime('%H:%M')}-{safe_end_time.strftime('%H:%M')} | "
                 f"signal_exit_min_hold={signal_exit_min_hold_seconds:.1f}s | "
                 f"signal_exit_cost_floor={signal_exit_cost_floor_desc} | "
+                f"max_open_loss={max_open_loss_desc} | "
                 f"reentry_cooldown={reentry_cooldown_seconds:.1f}s | "
                 f"shorting_allowed={'short' in trade_status_list} | "
                 f"cost_exchange={cost_exchange}"
@@ -1433,9 +1453,11 @@ def _generate_replay_memory(
     exit_long_signal = 0
     exit_long_trail = 0
     exit_long_take_profit = 0
+    exit_long_max_loss = 0
     exit_short_signal = 0
     exit_short_trail = 0
     exit_short_take_profit = 0
+    exit_short_max_loss = 0
     state_action_counts = {
         "flat": {"hold": 0, "buy": 0, "sell": 0},
         "long": {"hold": 0, "buy": 0, "sell": 0},
@@ -2156,14 +2178,27 @@ def _generate_replay_memory(
                         )
                         and signal_exit_cost_floor_ok
                     )
+                    net_pct_now = compute_net_percent_pnl(
+                        True,
+                        trade.entry_price,
+                        price,
+                        trade.quantity,
+                        cost_exchange,
+                    )
                     exit_take_profit = take_profit_price is not None and price >= take_profit_price
                     exit_trailing = stop_price is not None and price <= stop_price
-                    if signal_exit_allowed or exit_take_profit or exit_trailing:
+                    exit_max_loss = (
+                        max_open_loss_pct is not None
+                        and net_pct_now <= (-max_open_loss_pct)
+                    )
+                    if signal_exit_allowed or exit_take_profit or exit_max_loss or exit_trailing:
                         reason = (
                             "signal"
                             if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
+                            else "max_loss"
+                            if exit_max_loss
                             else "trailing_stop"
                         )
                         executed_events.append(
@@ -2180,16 +2215,12 @@ def _generate_replay_memory(
                             exit_long_signal += 1
                         elif reason == "take_profit":
                             exit_long_take_profit += 1
+                        elif reason == "max_loss":
+                            exit_long_max_loss += 1
                         elif reason == "trailing_stop":
                             exit_long_trail += 1
                         pending_reward_logs.append((ticker, trade, price, ts, list(executed_events)))
-                        percent_pnl_snapshot[ticker] = compute_net_percent_pnl(
-                            True,
-                            trade.entry_price,
-                            price,
-                            trade.quantity,
-                            cost_exchange,
-                        )
+                        percent_pnl_snapshot[ticker] = net_pct_now
                         _record_realized_pct(percent_pnl_snapshot[ticker])
                         _record_holding(trade, ts)
                         exited_trades.append((ticker, trade))
@@ -2238,14 +2269,27 @@ def _generate_replay_memory(
                         )
                         and signal_exit_cost_floor_ok
                     )
+                    net_pct_now = compute_net_percent_pnl(
+                        False,
+                        trade.entry_price,
+                        price,
+                        trade.quantity,
+                        cost_exchange,
+                    )
                     exit_take_profit = take_profit_price is not None and price <= take_profit_price
                     exit_trailing = stop_price is not None and price >= stop_price
-                    if signal_exit_allowed or exit_take_profit or exit_trailing:
+                    exit_max_loss = (
+                        max_open_loss_pct is not None
+                        and net_pct_now <= (-max_open_loss_pct)
+                    )
+                    if signal_exit_allowed or exit_take_profit or exit_max_loss or exit_trailing:
                         reason = (
                             "signal"
                             if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
+                            else "max_loss"
+                            if exit_max_loss
                             else "trailing_stop"
                         )
                         executed_events.append(
@@ -2262,16 +2306,12 @@ def _generate_replay_memory(
                             exit_short_signal += 1
                         elif reason == "take_profit":
                             exit_short_take_profit += 1
+                        elif reason == "max_loss":
+                            exit_short_max_loss += 1
                         elif reason == "trailing_stop":
                             exit_short_trail += 1
                         pending_reward_logs.append((ticker, trade, price, ts, list(executed_events)))
-                        percent_pnl_snapshot[ticker] = compute_net_percent_pnl(
-                            False,
-                            trade.entry_price,
-                            price,
-                            trade.quantity,
-                            cost_exchange,
-                        )
+                        percent_pnl_snapshot[ticker] = net_pct_now
                         _record_realized_pct(percent_pnl_snapshot[ticker])
                         _record_holding(trade, ts)
                         exited_trades.append((ticker, trade))
@@ -2629,9 +2669,10 @@ def _generate_replay_memory(
             print(
                 f"[diag:exec_mix] open_long={entry_long} open_short={entry_short} "
                 f"exit_long_signal={exit_long_signal} exit_long_take_profit={exit_long_take_profit} "
-                f"exit_long_trailing_stop={exit_long_trail} exit_short_signal={exit_short_signal} "
+                f"exit_long_max_loss={exit_long_max_loss} exit_long_trailing_stop={exit_long_trail} "
+                f"exit_short_signal={exit_short_signal} "
                 f"exit_short_take_profit={exit_short_take_profit} "
-                f"exit_short_trailing_stop={exit_short_trail}"
+                f"exit_short_max_loss={exit_short_max_loss} exit_short_trailing_stop={exit_short_trail}"
             )
         safe_min = min_reward if min_reward != float("inf") else 0.0
         safe_max = max_reward if max_reward != float("-inf") else 0.0

@@ -952,6 +952,13 @@ def run(args: argparse.Namespace) -> None:
             config.get("evaluation_signal_exit_cost_floor_pct"),
         ),
     )
+    max_open_loss_pct = _parse_optional_non_negative_float(
+        "max_open_loss_pct",
+        trading_cfg.get(
+            "max_open_loss_pct",
+            config.get("evaluation_max_open_loss_pct"),
+        ),
+    )
     reentry_cooldown_seconds = max(
         float(
             trading_cfg.get(
@@ -1039,12 +1046,18 @@ def run(args: argparse.Namespace) -> None:
             if signal_exit_cost_floor_pct is not None
             else "auto(roundtrip_cost)"
         )
+        max_open_loss_desc = (
+            f"{max_open_loss_pct:.4f}%"
+            if max_open_loss_pct is not None
+            else "disabled"
+        )
         print(
             f"[trade] Starting live loop | mode={mode} safe_window={safe_start_time}-{safe_end_time} "
             f"hard_end={hard_end_time} poll={poll_seconds:.1f}s "
             f"trailing_stop={trailing_stop_desc} take_profit={take_profit_desc} "
             f"signal_exit_min_hold={signal_exit_min_hold_seconds:.1f}s "
             f"signal_exit_cost_floor={signal_exit_cost_floor_desc} "
+            f"max_open_loss={max_open_loss_desc} "
             f"reentry_cooldown={reentry_cooldown_seconds:.1f}s"
         )
 
@@ -1293,9 +1306,25 @@ def run(args: argparse.Namespace) -> None:
                         )
                         and signal_exit_cost_floor_ok
                     )
+                    net_pct_now = compute_net_percent_pnl(
+                        True,
+                        trade.entry_price,
+                        price,
+                        trade.quantity,
+                        exchange,
+                    )
                     exit_take_profit = take_profit_price is not None and price >= take_profit_price
                     exit_trailing = stop_price is not None and price <= stop_price
-                    should_exit = signal_exit_allowed or exit_take_profit or exit_trailing
+                    exit_max_loss = (
+                        max_open_loss_pct is not None
+                        and net_pct_now <= (-max_open_loss_pct)
+                    )
+                    should_exit = (
+                        signal_exit_allowed
+                        or exit_take_profit
+                        or exit_max_loss
+                        or exit_trailing
+                    )
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -1309,12 +1338,14 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                             tag="exit_long",
                         )
-                        pnl = compute_net_percent_pnl(True, trade.entry_price, price, trade.quantity, exchange)
+                        pnl = net_pct_now
                         exit_reason = (
                             "signal"
                             if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
+                            else "max_loss"
+                            if exit_max_loss
                             else "trailing_stop"
                         )
                         if args.verbose:
@@ -1381,9 +1412,25 @@ def run(args: argparse.Namespace) -> None:
                         )
                         and signal_exit_cost_floor_ok
                     )
+                    net_pct_now = compute_net_percent_pnl(
+                        False,
+                        trade.entry_price,
+                        price,
+                        trade.quantity,
+                        exchange,
+                    )
                     exit_take_profit = take_profit_price is not None and price <= take_profit_price
                     exit_trailing = stop_price is not None and price >= stop_price
-                    should_exit = signal_exit_allowed or exit_take_profit or exit_trailing
+                    exit_max_loss = (
+                        max_open_loss_pct is not None
+                        and net_pct_now <= (-max_open_loss_pct)
+                    )
+                    should_exit = (
+                        signal_exit_allowed
+                        or exit_take_profit
+                        or exit_max_loss
+                        or exit_trailing
+                    )
                     if should_exit:
                         submit_market_order(
                             ticker=ticker,
@@ -1397,12 +1444,14 @@ def run(args: argparse.Namespace) -> None:
                             verbose=args.verbose,
                             tag="exit_short",
                         )
-                        pnl = compute_net_percent_pnl(False, trade.entry_price, price, trade.quantity, exchange)
+                        pnl = net_pct_now
                         exit_reason = (
                             "signal"
                             if signal_exit_allowed
                             else "take_profit"
                             if exit_take_profit
+                            else "max_loss"
+                            if exit_max_loss
                             else "trailing_stop"
                         )
                         if args.verbose:

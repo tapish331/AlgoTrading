@@ -409,6 +409,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         while True:
             iteration += 1
+            if not args.verbose:
+                print(f"i={iteration}", flush=True)
             loop_start = time.perf_counter()
             config = _load_config()
             train_cfg = config.get("train", {})
@@ -617,7 +619,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if current_pnl_tstat is not None and _coerce_finite_float(current_pnl_tstat) is None:
                     warn_count += 1
                 status_line = (
-                    f"i={iteration} "
                     f"tr={_fmt_triplet(training_avg_pct_pnl, training_trades, training_pos_trades)} "
                     f"ev={_fmt_triplet(current_avg_pct_pnl, current_trades, current_pos_trades)} "
                     f"win={_fmt_triplet(winner_avg_pct_pnl, winner_trades, winner_pos_trades)} "

@@ -410,7 +410,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         while True:
             iteration += 1
             if not args.verbose:
-                print(f"i={iteration}", flush=True)
+                print(f"i={iteration} ", end="", flush=True)
             loop_start = time.perf_counter()
             config = _load_config()
             train_cfg = config.get("train", {})
@@ -632,7 +632,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"warn={warn_count}"
                 )
                 print(status_line)
-                _append_train_log_line(status_line, logging_cfg, verbose=args.verbose)
+                _append_train_log_line(f"i={iteration} {status_line}", logging_cfg, verbose=args.verbose)
 
             if codex_cli_enabled:
                 codex_result = _run_codex_log_optimizer(

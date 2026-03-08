@@ -1195,12 +1195,48 @@ def run(args: argparse.Namespace) -> None:
             f"reentry_cooldown={reentry_cooldown_seconds:.1f}s"
         )
 
+    cycle_index = 0
+
+    def _print_cycle_start(cycle_number: int, started_at: datetime) -> None:
+        if args.verbose:
+            return
+        print(
+            f"[trade] c={cycle_number} start={started_at.isoformat(timespec='seconds')} "
+            f"active={len(active_trades)} mode={mode} ",
+            end="",
+            flush=True,
+        )
+
+    def _print_cycle_end(
+        cycle_number: int,
+        started_perf: float,
+        reason: str,
+        *,
+        entries: int,
+        exits: int,
+        codex_status: str,
+    ) -> None:
+        if args.verbose:
+            return
+        elapsed = max(time.perf_counter() - started_perf, 0.0)
+        print(
+            f"c={cycle_number} end reason={reason} dt={elapsed:.1f}s "
+            f"entry={entries} exit={exits} active={len(active_trades)} codex={codex_status}",
+            flush=True,
+        )
+
     try:
         while True:
+            cycle_index += 1
+            cycle_started_perf = time.perf_counter()
             now_ist = datetime.now(INDIA_TZ)
+            cycle_entries = 0
+            cycle_exits = 0
+            _print_cycle_start(cycle_index, now_ist)
             if now_ist >= hard_cutoff:
                 if args.verbose:
                     print("[trade] Hard end time reached; square-off and stop.")
+                cycle_exits += len(active_trades)
                 _close_all_positions(
                     active_trades=active_trades,
                     prices={},
@@ -1216,6 +1252,14 @@ def run(args: argparse.Namespace) -> None:
                     trade_status_indices=trade_status_indices,
                     flat_status_idx=flat_status_idx,
                 )
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "hard_end",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
+                )
                 break
 
             try:
@@ -1229,6 +1273,14 @@ def run(args: argparse.Namespace) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"[trade] Market snapshot failed: {exc}", file=sys.stderr)
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "snapshot_error",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
+                )
                 _sleep(poll_seconds, args.verbose, "snapshot_error")
                 continue
     
@@ -1237,6 +1289,14 @@ def run(args: argparse.Namespace) -> None:
             if not decision_history:
                 if args.verbose:
                     print("[trade] No decision timeframe data available; retrying")
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "missing_decision_interval",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
+                )
                 _sleep(poll_seconds, args.verbose, "missing_decision_interval")
                 continue
     
@@ -1246,6 +1306,14 @@ def run(args: argparse.Namespace) -> None:
                     print(
                         f"[trade] Current time {now_ist} before safe start {safe_start_time}; waiting"
                     )
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "pre_safe_window",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
+                )
                 _sleep(poll_seconds, args.verbose, "pre_safe_window")
                 continue
             decision_positions = {
@@ -1323,6 +1391,14 @@ def run(args: argparse.Namespace) -> None:
                             continue
                         joined = "; ".join(reasons)
                         print(f"[trade]   -> {ticker}: {joined}")
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "missing_features",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
+                )
                 _sleep(poll_seconds, args.verbose, "missing_features")
                 continue
     
@@ -1375,6 +1451,7 @@ def run(args: argparse.Namespace) -> None:
             if local_time_now >= safe_end_time:
                 if args.verbose:
                     print("[trade] Safe end window reached; closing open trades")
+                cycle_exits += len(active_trades)
                 _close_all_positions(
                     active_trades=active_trades,
                     prices=prices,
@@ -1389,6 +1466,14 @@ def run(args: argparse.Namespace) -> None:
                     status_long_label=status_long_label,
                     trade_status_indices=trade_status_indices,
                     flat_status_idx=flat_status_idx,
+                )
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "safe_end",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
                 )
                 _sleep(poll_seconds, args.verbose, "safe_end_wait")
                 continue
@@ -1499,6 +1584,7 @@ def run(args: argparse.Namespace) -> None:
                             status_long_label=status_long_label,
                             verbose=args.verbose,
                         )
+                        cycle_exits += 1
                         trade_status_indices[ticker] = flat_status_idx
                         last_exit_time_ist[ticker] = now_ist
                         del active_trades[ticker]
@@ -1605,6 +1691,7 @@ def run(args: argparse.Namespace) -> None:
                             status_long_label=status_long_label,
                             verbose=args.verbose,
                         )
+                        cycle_exits += 1
                         trade_status_indices[ticker] = flat_status_idx
                         last_exit_time_ist[ticker] = now_ist
                         del active_trades[ticker]
@@ -1615,12 +1702,13 @@ def run(args: argparse.Namespace) -> None:
                         )
 
             if len(active_trades) >= max_concurrent:
-                _print_active_trades_summary(
-                    active_trades,
-                    prices,
-                    exchange,
-                    status_long_label,
-                )
+                if args.verbose:
+                    _print_active_trades_summary(
+                        active_trades,
+                        prices,
+                        exchange,
+                        status_long_label,
+                    )
                 _persist_active_trades_state(
                     ACTIVE_TRADES_PATH,
                     active_trades,
@@ -1637,6 +1725,14 @@ def run(args: argparse.Namespace) -> None:
                         for t, trade in active_trades.items()
                         if prices.get(t) is not None
                     },
+                )
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "max_concurrent",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="skip",
                 )
                 _sleep(poll_seconds, args.verbose, "max_concurrent_reached")
                 continue
@@ -1703,6 +1799,7 @@ def run(args: argparse.Namespace) -> None:
                         take_profit_price=initial_take_profit_price,
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
+                    cycle_entries += 1
                     trade_status_indices[ticker] = long_status_idx
                     if args.verbose:
                         print(
@@ -1747,6 +1844,7 @@ def run(args: argparse.Namespace) -> None:
                         take_profit_price=initial_take_profit_price,
                         data_timestamp=_ist_iso_from_any(signal_ts),
                     )
+                    cycle_entries += 1
                     trade_status_indices[ticker] = short_status_idx
                     if args.verbose:
                         print(
@@ -1759,12 +1857,13 @@ def run(args: argparse.Namespace) -> None:
                         verbose=args.verbose,
                     )
     
-            _print_active_trades_summary(
-                active_trades,
-                prices,
-                exchange,
-                status_long_label,
-            )
+            if args.verbose:
+                _print_active_trades_summary(
+                    active_trades,
+                    prices,
+                    exchange,
+                    status_long_label,
+                )
             current_prices = {
                 t: p for t, p in prices.items() if t in active_trades and p is not None
             }
@@ -1799,12 +1898,29 @@ def run(args: argparse.Namespace) -> None:
 
             if codex_result.get("decision") == "modified":
                 reason = codex_result.get("reason", "").strip() or "no reason provided"
-                print(f"[trade] Codex applied best modification ({reason}); exiting.")
+                if args.verbose:
+                    print(f"[trade] Codex applied best modification ({reason}); exiting.")
+                _print_cycle_end(
+                    cycle_index,
+                    cycle_started_perf,
+                    "codex_modified",
+                    entries=cycle_entries,
+                    exits=cycle_exits,
+                    codex_status="modified",
+                )
                 return
             if args.verbose:
                 reason = codex_result.get("reason", "").strip() or "no reason provided"
                 print(f"[trade] Codex decision=insufficient ({reason})")
 
+            _print_cycle_end(
+                cycle_index,
+                cycle_started_perf,
+                "cycle_complete",
+                entries=cycle_entries,
+                exits=cycle_exits,
+                codex_status=str(codex_result.get("decision", "insufficient")),
+            )
             _sleep(poll_seconds, args.verbose, "cycle_complete")
     
     finally:

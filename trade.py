@@ -6,6 +6,9 @@ from collections import deque
 import argparse
 import json
 import logging
+import math
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +58,19 @@ DEFAULT_LOG_FILE_PREFIX = "trade"
 DEFAULT_LOG_RETENTION_DAYS = 5
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_VERBOSE_LOG_LEVEL = "DEBUG"
+CODEX_AUTOMATION_DIR = STATE_DIR / ".codex_auto"
+CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
+CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "trade_decision_output.json"
+DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
+CODEX_DECISION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["insufficient", "modified"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["decision", "reason"],
+    "additionalProperties": False,
+}
 
 _ORIGINAL_STDOUT: Optional[Any] = None
 _ORIGINAL_STDERR: Optional[Any] = None
@@ -133,6 +149,30 @@ def _normalize_log_level(value: Any, default: int) -> int:
     return lookup.get(str(value).strip().upper(), default)
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _coerce_finite_float(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
 def _load_logging_config(path: Path) -> tuple[Dict[str, Any], Optional[str]]:
     if not path.exists():
         return {}, f"Config file missing at {path}"
@@ -145,6 +185,96 @@ def _load_logging_config(path: Path) -> tuple[Dict[str, Any], Optional[str]]:
         return {}, "Config 'logging' section is not a dict"
     except Exception as exc:  # noqa: BLE001
         return {}, f"Failed to read logging config ({exc})"
+
+
+def _ensure_codex_decision_schema() -> Path:
+    CODEX_AUTOMATION_DIR.mkdir(parents=True, exist_ok=True)
+    if not CODEX_DECISION_SCHEMA_PATH.exists():
+        with CODEX_DECISION_SCHEMA_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(CODEX_DECISION_SCHEMA, handle, indent=2)
+    return CODEX_DECISION_SCHEMA_PATH
+
+
+def _truncate_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8"):
+        pass
+
+
+def _run_codex_trade_optimizer(
+    completed_trades_path: Path,
+    *,
+    verbose: bool,
+    timeout_seconds: float,
+) -> Dict[str, str]:
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return {"decision": "insufficient", "reason": "codex_cli_missing"}
+    try:
+        if not completed_trades_path.exists() or completed_trades_path.stat().st_size <= 0:
+            return {"decision": "insufficient", "reason": "completed_trades_missing_or_empty"}
+    except OSError:
+        return {"decision": "insufficient", "reason": "completed_trades_unreadable"}
+
+    schema_path = _ensure_codex_decision_schema()
+    output_path = CODEX_DECISION_OUTPUT_PATH
+    try:
+        _truncate_file(output_path)
+    except OSError as exc:
+        return {"decision": "insufficient", "reason": f"codex_output_unwritable:{exc}"}
+    prompt = (
+        "Inspect today's completed trades JSONL and decide whether one best code modification is justified.\n"
+        f"Today's completed trades path: {completed_trades_path.resolve()}\n"
+        "Return decision='insufficient' if data is not strong enough, and do not edit files.\n"
+        "Return decision='modified' only if you implemented exactly one best high-impact modification in this repo.\n"
+        "Keep edits minimal, avoid destructive git operations, and do not run long live-trading loops.\n"
+        "Always include a short reason."
+    )
+    cmd = [
+        codex_bin,
+        "exec",
+        "--ephemeral",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--output-schema",
+        str(schema_path),
+        "-o",
+        str(output_path),
+        prompt,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_seconds, 1.0),
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"decision": "insufficient", "reason": "codex_cli_missing"}
+    except subprocess.TimeoutExpired:
+        return {"decision": "insufficient", "reason": "codex_cli_timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"decision": "insufficient", "reason": f"codex_cli_error:{exc}"}
+
+    if completed.returncode != 0:
+        if verbose:
+            stderr = (completed.stderr or "").strip()
+            if stderr:
+                print(f"[trade] Codex CLI failed: {stderr}", file=sys.stderr)
+        return {"decision": "insufficient", "reason": f"codex_cli_exit_{completed.returncode}"}
+
+    try:
+        with output_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:  # noqa: BLE001
+        return {"decision": "insufficient", "reason": "codex_cli_invalid_output"}
+
+    decision = str(payload.get("decision", "insufficient")).strip().lower()
+    reason = str(payload.get("reason", "")).strip()
+    if decision not in {"insufficient", "modified"}:
+        return {"decision": "insufficient", "reason": "codex_cli_unknown_decision"}
+    return {"decision": decision, "reason": reason}
 
 
 def _cleanup_old_logs(
@@ -881,6 +1011,10 @@ def run(args: argparse.Namespace) -> None:
         poll_seconds = 0.0
 
     mode = str(trading_cfg.get("mode", "paper")).lower()
+    codex_timeout_seconds = _coerce_finite_float(trading_cfg.get("codex_cli_timeout_seconds"))
+    if codex_timeout_seconds is None or codex_timeout_seconds <= 0:
+        codex_timeout_seconds = DEFAULT_CODEX_TIMEOUT_SECONDS
+    codex_cli_enabled = _coerce_bool(trading_cfg.get("codex_cli_enabled", True), default=True)
     product = DEFAULT_PRODUCT
     order_type = DEFAULT_ORDER_TYPE
     env_path = DEFAULT_ENV_PATH.expanduser()
@@ -1653,6 +1787,24 @@ def run(args: argparse.Namespace) -> None:
                 current_prices=current_prices,
                 current_pnls=current_pnls,
             )
+            if codex_cli_enabled:
+                today_completed_path = _completed_trades_log_path(now_ist)
+                codex_result = _run_codex_trade_optimizer(
+                    today_completed_path,
+                    verbose=args.verbose,
+                    timeout_seconds=codex_timeout_seconds,
+                )
+            else:
+                codex_result = {"decision": "insufficient", "reason": "codex_cli_disabled"}
+
+            if codex_result.get("decision") == "modified":
+                reason = codex_result.get("reason", "").strip() or "no reason provided"
+                print(f"[trade] Codex applied best modification ({reason}); exiting.")
+                return
+            if args.verbose:
+                reason = codex_result.get("reason", "").strip() or "no reason provided"
+                print(f"[trade] Codex decision=insufficient ({reason})")
+
             _sleep(poll_seconds, args.verbose, "cycle_complete")
     
     finally:

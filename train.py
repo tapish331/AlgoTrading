@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import math
 import hashlib
 import json
+import math
+import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -39,6 +41,33 @@ WINNER_CHECKPOINT = CHECKPOINT_DIR / "light_rainbow_winner.pt"
 META_PATH = CHECKPOINT_DIR / "winner_meta.json"
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE_PREFIX = "train"
+CODEX_AUTOMATION_DIR = CHECKPOINT_DIR / ".codex_auto"
+CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
+CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "decision_output.json"
+DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
+CODEX_DECISION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["insufficient", "modified"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["decision", "reason"],
+    "additionalProperties": False,
+}
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
 
 
 def _fmt_pct(value: Any) -> str:
@@ -69,6 +98,151 @@ def _fmt_triplet(avg_pct: Any, total: Any, positive: Any) -> str:
     return f"{_fmt_pct(avg_pct)}/{_fmt_int(total)}/+{_fmt_int(positive)}"
 
 
+def _coerce_finite_float(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def _fmt_float(value: Any, decimals: int = 4, suffix: str = "") -> str:
+    num = _coerce_finite_float(value)
+    if num is None:
+        return "na"
+    return f"{num:.{decimals}f}{suffix}"
+
+
+def _fmt_signed_float(value: Any, decimals: int = 4) -> str:
+    num = _coerce_finite_float(value)
+    if num is None:
+        return "na"
+    return f"{num:+.{decimals}f}"
+
+
+def _resolve_train_log_path(logging_cfg: Dict[str, Any]) -> Path:
+    log_dir = Path(logging_cfg.get("dir", DEFAULT_LOG_DIR))
+    if not log_dir.is_absolute():
+        log_dir = BASE_DIR / log_dir
+    file_prefix_raw = (
+        logging_cfg.get("file_prefix_train")
+        or logging_cfg.get("file_prefix")
+        or DEFAULT_LOG_FILE_PREFIX
+    )
+    file_prefix = str(file_prefix_raw).strip() or DEFAULT_LOG_FILE_PREFIX
+    return log_dir / f"{file_prefix}.log"
+
+
+def _append_train_log_line(line: str, logging_cfg: Dict[str, Any], verbose: bool = False) -> None:
+    log_path = _resolve_train_log_path(logging_cfg)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} | INFO | {line}\n")
+    except OSError as write_exc:
+        if verbose:
+            print(f"[train] Failed to append train loop log: {write_exc}", file=sys.stderr)
+
+
+def _ensure_codex_decision_schema() -> Path:
+    CODEX_AUTOMATION_DIR.mkdir(parents=True, exist_ok=True)
+    if not CODEX_DECISION_SCHEMA_PATH.exists():
+        with CODEX_DECISION_SCHEMA_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(CODEX_DECISION_SCHEMA, handle, indent=2)
+    return CODEX_DECISION_SCHEMA_PATH
+
+
+def _truncate_file(path: Path, verbose: bool = False) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        if verbose:
+            print(f"[train] Failed to truncate {path}: {exc}", file=sys.stderr)
+
+
+def _run_codex_log_optimizer(
+    logging_cfg: Dict[str, Any],
+    verbose: bool = False,
+    timeout_seconds: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
+) -> Dict[str, str]:
+    log_path = _resolve_train_log_path(logging_cfg)
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return {"decision": "insufficient", "reason": "codex_cli_missing"}
+    if not log_path.exists() or log_path.stat().st_size <= 0:
+        return {"decision": "insufficient", "reason": "log_empty"}
+    schema_path = _ensure_codex_decision_schema()
+    output_path = CODEX_DECISION_OUTPUT_PATH
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _truncate_file(output_path, verbose=verbose)
+
+    prompt = (
+        "Inspect the training loop log and decide whether one best code modification is justified now.\n"
+        f"Training log path: {log_path.resolve()}\n"
+        "Return decision='insufficient' if evidence is not strong enough and do not edit files.\n"
+        "Return decision='modified' only if you implemented exactly one best high-impact modification in this repo.\n"
+        "If decision='modified', truncate the training log file to empty after applying the change.\n"
+        "Keep edits minimal, avoid destructive git operations, and do not run long training jobs.\n"
+        "Always include a short reason."
+    )
+    cmd = [
+        codex_bin,
+        "exec",
+        "--ephemeral",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--output-schema",
+        str(schema_path),
+        "-o",
+        str(output_path),
+        prompt,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_seconds, 1.0),
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"decision": "insufficient", "reason": "codex_cli_missing"}
+    except subprocess.TimeoutExpired:
+        return {"decision": "insufficient", "reason": "codex_cli_timeout"}
+    except Exception as exc:  # noqa: BLE001
+        return {"decision": "insufficient", "reason": f"codex_cli_error:{exc}"}
+
+    if completed.returncode != 0:
+        if verbose:
+            stderr = (completed.stderr or "").strip()
+            if stderr:
+                print(f"[train] Codex CLI failed: {stderr}", file=sys.stderr)
+        return {"decision": "insufficient", "reason": f"codex_cli_exit_{completed.returncode}"}
+
+    try:
+        with output_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:  # noqa: BLE001
+        return {"decision": "insufficient", "reason": "codex_cli_invalid_output"}
+
+    decision = str(payload.get("decision", "insufficient")).strip().lower()
+    reason = str(payload.get("reason", ""))
+    if decision not in {"insufficient", "modified"}:
+        return {"decision": "insufficient", "reason": "codex_cli_unknown_decision"}
+    if decision == "modified":
+        try:
+            if log_path.exists() and log_path.stat().st_size > 0:
+                _truncate_file(log_path, verbose=verbose)
+        except OSError:
+            pass
+    return {"decision": decision, "reason": reason}
+
+
 def _load_logging_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
@@ -85,20 +259,13 @@ def _load_logging_config(path: Path) -> Dict[str, Any]:
 
 def _write_fatal_error(exc: BaseException) -> None:
     logging_cfg = _load_logging_config(CONFIG_PATH)
-    log_dir = Path(logging_cfg.get("dir", DEFAULT_LOG_DIR))
-    file_prefix_raw = (
-        logging_cfg.get("file_prefix_train")
-        or logging_cfg.get("file_prefix")
-        or DEFAULT_LOG_FILE_PREFIX
-    )
-    file_prefix = str(file_prefix_raw).strip() or DEFAULT_LOG_FILE_PREFIX
-    log_path = log_dir / f"{file_prefix}.log"
+    log_path = _resolve_train_log_path(logging_cfg)
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
         message = f"{timestamp} | ERROR | Fatal error: {exc}\n{trace}\n"
-        with log_path.open("w", encoding="utf-8") as handle:
+        with log_path.open("a", encoding="utf-8") as handle:
             handle.write(message)
     except OSError as write_exc:
         print(f"[train] Failed to write fatal error log: {write_exc}", file=sys.stderr)
@@ -245,6 +412,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             loop_start = time.perf_counter()
             config = _load_config()
             train_cfg = config.get("train", {})
+            logging_cfg = config.get("logging", {})
+            if not isinstance(logging_cfg, dict):
+                logging_cfg = {}
+            codex_timeout_seconds = _coerce_finite_float(train_cfg.get("codex_cli_timeout_seconds"))
+            if codex_timeout_seconds is None:
+                codex_timeout_seconds = DEFAULT_CODEX_TIMEOUT_SECONDS
+            codex_cli_enabled = _coerce_bool(train_cfg.get("codex_cli_enabled", True), default=True)
             train_mode = str(train_cfg.get("mode", "RL")).upper()
             if args.verbose:
                 print(f"[train] Using train.mode={train_mode}")
@@ -265,17 +439,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"[train] Promotion metrics: primary={promotion_metric}, fallback={fallback_metric}")
             winner_path = WINNER_CHECKPOINT
 
+            phase_start = time.perf_counter()
             training_summary = populate_training_replay_memory(verbose=args.verbose)
+            replay_train_runtime = time.perf_counter() - phase_start
             training_avg_pct_pnl = training_summary.get("avg_pct_pnl")
             training_trades = training_summary.get("completed_trades", 0)
             training_pos_trades = training_summary.get("positive_trades", 0)
+            training_records = int(training_summary.get("records", 0) or 0)
             train_args = SimpleNamespace(
                 verbose=args.verbose,
                 replay_path=str(training_summary["path"]),
                 input_dim=None,
                 hidden_layers=None,
             )
+            phase_start = time.perf_counter()
             train_agent(train_args)
+            train_runtime = time.perf_counter() - phase_start
 
             promotion_trailing_stop = float(
                 config.get(
@@ -296,11 +475,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"take_profit_mult={promotion_take_profit:.4f}"
                 )
 
+            phase_start = time.perf_counter()
             eval_summary = populate_evaluation_replay_memory(
                 verbose=args.verbose,
                 override_trailing_stop=promotion_trailing_stop,
                 override_take_profit=promotion_take_profit,
             )
+            replay_eval_runtime = time.perf_counter() - phase_start
             current_avg_reward = eval_summary.get("avg_reward", float("nan"))
             current_avg_pct_pnl = eval_summary.get("avg_pct_pnl")
             current_total_pct_pnl = eval_summary.get("total_pct_pnl")
@@ -308,6 +489,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             current_pnl_tstat = eval_summary.get("pnl_tstat")
             current_trades = int(eval_summary.get("completed_trades", 0) or 0)
             current_pos_trades = int(eval_summary.get("positive_trades", 0) or 0)
+            eval_records = int(eval_summary.get("records", 0) or 0)
             metric_values = {
                 "pnl_tstat": current_pnl_tstat,
                 "avg_pct_pnl": current_avg_pct_pnl,
@@ -407,13 +589,68 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if not args.verbose:
                 loop_runtime = time.perf_counter() - loop_start
-                print(
+                current_score_num = _coerce_finite_float(promotion_score)
+                winner_score_num = _coerce_finite_float(winner_promotion_score)
+                score_delta = (
+                    current_score_num - winner_score_num
+                    if current_score_num is not None and winner_score_num is not None
+                    else None
+                )
+                win_rate_pct = (
+                    (float(current_pos_trades) / float(current_trades)) * 100.0
+                    if current_trades > 0
+                    else None
+                )
+                warn_count = 0
+                if training_records <= 0:
+                    warn_count += 1
+                if eval_records <= 0:
+                    warn_count += 1
+                if current_score_num is None:
+                    warn_count += 1
+                if not can_promote:
+                    warn_count += 1
+                if _coerce_finite_float(current_avg_reward) is None:
+                    warn_count += 1
+                if current_avg_pct_pnl is not None and _coerce_finite_float(current_avg_pct_pnl) is None:
+                    warn_count += 1
+                if current_pnl_tstat is not None and _coerce_finite_float(current_pnl_tstat) is None:
+                    warn_count += 1
+                status_line = (
                     f"i={iteration} "
                     f"tr={_fmt_triplet(training_avg_pct_pnl, training_trades, training_pos_trades)} "
                     f"ev={_fmt_triplet(current_avg_pct_pnl, current_trades, current_pos_trades)} "
                     f"win={_fmt_triplet(winner_avg_pct_pnl, winner_trades, winner_pos_trades)} "
+                    f"score={promotion_metric_used}:{_fmt_float(current_score_num)}|"
+                    f"win:{_fmt_float(winner_score_num)}|"
+                    f"d:{_fmt_signed_float(score_delta)} "
                     f"p={'Y' if should_promote else 'N'} rt={loop_runtime:.2f}s"
+                    f" data={training_records}/{eval_records} "
+                    f"evrisk={_fmt_float(current_pnl_tstat)}/{_fmt_pct(current_avg_pct_pnl)}/{_fmt_float(win_rate_pct, decimals=1, suffix='%')} "
+                    f"t={replay_train_runtime:.1f}/{train_runtime:.1f}/{replay_eval_runtime:.1f} "
+                    f"warn={warn_count}"
                 )
+                print(status_line)
+                _append_train_log_line(status_line, logging_cfg, verbose=args.verbose)
+
+            if codex_cli_enabled:
+                codex_result = _run_codex_log_optimizer(
+                    logging_cfg=logging_cfg,
+                    verbose=args.verbose,
+                    timeout_seconds=codex_timeout_seconds,
+                )
+            else:
+                codex_result = {"decision": "insufficient", "reason": "codex_cli_disabled"}
+            if codex_result.get("decision") == "modified":
+                reason = codex_result.get("reason", "").strip() or "no reason provided"
+                print(f"[train] Codex applied best modification ({reason}); restarting process.")
+                try:
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                except OSError as exc:
+                    print(f"[train] Failed to restart process after Codex modification: {exc}", file=sys.stderr)
+            elif args.verbose:
+                reason = codex_result.get("reason", "").strip() or "no reason provided"
+                print(f"[train] Codex decision=insufficient ({reason})")
 
             time.sleep(max(args.sleep, 0.1))
     except KeyboardInterrupt:

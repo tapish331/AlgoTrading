@@ -1221,7 +1221,7 @@ def run(args: argparse.Namespace) -> None:
         elapsed = max(time.perf_counter() - started_perf, 0.0)
         print(
             f"c={cycle_number} end reason={reason} dt={elapsed:.1f}s "
-            f"entry={entries} exit={exits} active={len(active_trades)} codex={codex_status}",
+            f"entry={entries} exit={exits} active={len(active_trades)}",
             flush=True,
         )
 

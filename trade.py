@@ -1886,40 +1886,13 @@ def run(args: argparse.Namespace) -> None:
                 current_prices=current_prices,
                 current_pnls=current_pnls,
             )
-            if codex_cli_enabled:
-                today_completed_path = _completed_trades_log_path(now_ist)
-                codex_result = _run_codex_trade_optimizer(
-                    today_completed_path,
-                    verbose=args.verbose,
-                    timeout_seconds=codex_timeout_seconds,
-                )
-            else:
-                codex_result = {"decision": "insufficient", "reason": "codex_cli_disabled"}
-
-            if codex_result.get("decision") == "modified":
-                reason = codex_result.get("reason", "").strip() or "no reason provided"
-                if args.verbose:
-                    print(f"[trade] Codex applied best modification ({reason}); exiting.")
-                _print_cycle_end(
-                    cycle_index,
-                    cycle_started_perf,
-                    "codex_modified",
-                    entries=cycle_entries,
-                    exits=cycle_exits,
-                    codex_status="modified",
-                )
-                return
-            if args.verbose:
-                reason = codex_result.get("reason", "").strip() or "no reason provided"
-                print(f"[trade] Codex decision=insufficient ({reason})")
-
             _print_cycle_end(
                 cycle_index,
                 cycle_started_perf,
                 "cycle_complete",
                 entries=cycle_entries,
                 exits=cycle_exits,
-                codex_status=str(codex_result.get("decision", "insufficient")),
+                codex_status=("deferred" if codex_cli_enabled else "disabled"),
             )
             _sleep(poll_seconds, args.verbose, "cycle_complete")
     
@@ -1956,6 +1929,22 @@ def run(args: argparse.Namespace) -> None:
             flat_status_idx=flat_status_idx,
         )
     _run_post_session_fetch(args.verbose)
+
+    if codex_cli_enabled:
+        final_completed_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
+        codex_result = _run_codex_trade_optimizer(
+            final_completed_path,
+            verbose=args.verbose,
+            timeout_seconds=codex_timeout_seconds,
+        )
+        decision = str(codex_result.get("decision", "insufficient")).strip().lower()
+        reason = str(codex_result.get("reason", "")).strip() or "no reason provided"
+        if decision == "modified":
+            print(f"[trade] End-of-day Codex applied best modification ({reason}); exiting.")
+        elif args.verbose:
+            print(f"[trade] End-of-day Codex decision=insufficient ({reason})")
+    elif args.verbose:
+        print("[trade] End-of-day Codex review skipped (codex_cli_enabled=false).")
 
 
 def _build_parser() -> argparse.ArgumentParser:

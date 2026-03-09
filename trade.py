@@ -53,6 +53,7 @@ DEFAULT_WINNER_CHECKPOINT = Path("checkpoints/light_rainbow_winner.pt")
 STATE_DIR = Path("state")
 ACTIVE_TRADES_PATH = STATE_DIR / "active_trades.json"
 COMPLETED_TRADES_DIR = STATE_DIR / "completed_trades"
+AUTO_REPAIR_DIR = STATE_DIR / "auto_repair"
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE_PREFIX = "trade"
 DEFAULT_LOG_RETENTION_DAYS = 5
@@ -997,6 +998,30 @@ def _run_post_session_fetch(verbose: bool) -> None:
         )
 
 
+def _clear_trade_auto_repair_logs(verbose: bool) -> None:
+    base_dir = Path(__file__).resolve().parent
+    auto_repair_path = base_dir / AUTO_REPAIR_DIR
+    if not auto_repair_path.exists():
+        return
+
+    cleared = 0
+    for path in auto_repair_path.iterdir():
+        if not path.is_file():
+            continue
+        if not path.name.startswith("trade"):
+            continue
+        try:
+            with path.open("w", encoding="utf-8"):
+                pass
+            cleared += 1
+        except OSError as exc:
+            if verbose:
+                print(f"[trade] Failed to clear auto-repair log {path}: {exc}", file=sys.stderr)
+
+    if verbose:
+        print(f"[trade] Cleared {cleared} trade auto-repair log file(s) in {auto_repair_path}")
+
+
 def run(args: argparse.Namespace) -> None:
     config = load_config()
     model = _load_model(config, args.verbose)
@@ -1220,7 +1245,7 @@ def run(args: argparse.Namespace) -> None:
             return
         elapsed = max(time.perf_counter() - started_perf, 0.0)
         print(
-            f"c={cycle_number} end reason={reason} dt={elapsed:.1f}s "
+            f"end reason={reason} dt={elapsed:.1f}s "
             f"entry={entries} exit={exits} active={len(active_trades)}",
             flush=True,
         )
@@ -1941,10 +1966,12 @@ def run(args: argparse.Namespace) -> None:
         reason = str(codex_result.get("reason", "")).strip() or "no reason provided"
         if decision == "modified":
             print(f"[trade] End-of-day Codex applied best modification ({reason}); exiting.")
-        elif args.verbose:
+        else:
             print(f"[trade] End-of-day Codex decision=insufficient ({reason})")
-    elif args.verbose:
-        print("[trade] End-of-day Codex review skipped (codex_cli_enabled=false).")
+    else:
+        print("[trade] End-of-day Codex decision=skipped (codex_cli_enabled=false).")
+
+    _clear_trade_auto_repair_logs(args.verbose)
 
 
 def _build_parser() -> argparse.ArgumentParser:

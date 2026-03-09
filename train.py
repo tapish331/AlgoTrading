@@ -404,13 +404,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"-p{os.getpid()}"
     iteration = 0
 
     try:
         while True:
             iteration += 1
             if not args.verbose:
-                print(f"i={iteration} ", end="", flush=True)
+                print(f"run={run_id} i={iteration} ", end="", flush=True)
             loop_start = time.perf_counter()
             config = _load_config()
             train_cfg = config.get("train", {})
@@ -589,6 +590,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 elif args.verbose:
                     print("[train] Existing winner checkpoint still better; no promotion.")
 
+            status_line: Optional[str] = None
             if not args.verbose:
                 loop_runtime = time.perf_counter() - loop_start
                 current_score_num = _coerce_finite_float(promotion_score)
@@ -631,8 +633,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"t={replay_train_runtime:.1f}/{train_runtime:.1f}/{replay_eval_runtime:.1f} "
                     f"warn={warn_count}"
                 )
-                print(status_line)
-                _append_train_log_line(f"i={iteration} {status_line}", logging_cfg, verbose=args.verbose)
 
             if codex_cli_enabled:
                 codex_result = _run_codex_log_optimizer(
@@ -640,11 +640,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                     verbose=args.verbose,
                     timeout_seconds=codex_timeout_seconds,
                 )
+                codex_status = str(codex_result.get("decision", "insufficient")).strip().lower() or "insufficient"
             else:
                 codex_result = {"decision": "insufficient", "reason": "codex_cli_disabled"}
+                codex_status = "disabled"
+
+            if not args.verbose and status_line is not None:
+                status_line = f"{status_line} codex={codex_status}"
+                print(status_line)
+                _append_train_log_line(
+                    f"run={run_id} i={iteration} {status_line}",
+                    logging_cfg,
+                    verbose=args.verbose,
+                )
+
             if codex_result.get("decision") == "modified":
                 reason = codex_result.get("reason", "").strip() or "no reason provided"
-                print(f"[train] Codex applied best modification ({reason}); restarting process.")
+                if args.verbose:
+                    print(f"[train] Codex applied best modification ({reason}); restarting process.")
                 try:
                     os.execv(sys.executable, [sys.executable, *sys.argv])
                 except OSError as exc:

@@ -44,6 +44,7 @@ DEFAULT_LOG_FILE_PREFIX = "train"
 CODEX_AUTOMATION_DIR = CHECKPOINT_DIR / ".codex_auto"
 CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
 CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "decision_output.json"
+SHARED_CODE_UPDATE_MARKER_PATH = BASE_DIR / "state" / ".codex_auto" / "code_updated_marker.json"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -163,6 +164,38 @@ def _truncate_file(path: Path, verbose: bool = False) -> None:
     except OSError as exc:
         if verbose:
             print(f"[train] Failed to truncate {path}: {exc}", file=sys.stderr)
+
+
+def _read_shared_code_update_marker_fingerprint() -> Optional[str]:
+    path = SHARED_CODE_UPDATE_MARKER_PATH
+    try:
+        if not path.exists():
+            return None
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_shared_code_update_marker(source: str, reason: str, verbose: bool = False) -> None:
+    path = SHARED_CODE_UPDATE_MARKER_PATH
+    payload_base = {
+        "source": source,
+        "reason": reason,
+        "pid": os.getpid(),
+        "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "nonce": time.time_ns(),
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(payload_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {**payload_base, "hash": payload_hash}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[train] Failed to write shared code update marker {path}: {exc}", file=sys.stderr)
 
 
 def _run_codex_log_optimizer(
@@ -406,9 +439,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"-p{os.getpid()}"
     iteration = 0
+    seen_marker_fingerprint = _read_shared_code_update_marker_fingerprint()
 
     try:
         while True:
+            current_marker_fingerprint = _read_shared_code_update_marker_fingerprint()
+            if current_marker_fingerprint != seen_marker_fingerprint:
+                print("[train] Shared code update marker changed; restarting process.", flush=True)
+                try:
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                except OSError as exc:
+                    print(f"[train] Failed to restart on shared code marker update: {exc}", file=sys.stderr)
+                    seen_marker_fingerprint = current_marker_fingerprint
+
             iteration += 1
             if not args.verbose:
                 print(f"run={run_id} i={iteration} ", end="", flush=True)
@@ -633,6 +676,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"t={replay_train_runtime:.1f}/{train_runtime:.1f}/{replay_eval_runtime:.1f} "
                     f"warn={warn_count}"
                 )
+                _append_train_log_line(
+                    f"run={run_id} i={iteration} {status_line}",
+                    logging_cfg,
+                    verbose=args.verbose,
+                )
 
             if codex_cli_enabled:
                 codex_result = _run_codex_log_optimizer(
@@ -648,14 +696,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not args.verbose and status_line is not None:
                 status_line = f"{status_line} codex={codex_status}"
                 print(status_line)
-                _append_train_log_line(
-                    f"run={run_id} i={iteration} {status_line}",
-                    logging_cfg,
-                    verbose=args.verbose,
-                )
 
             if codex_result.get("decision") == "modified":
                 reason = codex_result.get("reason", "").strip() or "no reason provided"
+                _write_shared_code_update_marker("train", reason, verbose=args.verbose)
                 if args.verbose:
                     print(f"[train] Codex applied best modification ({reason}); restarting process.")
                 try:

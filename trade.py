@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections import deque
 import argparse
+import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -54,6 +56,7 @@ STATE_DIR = Path("state")
 ACTIVE_TRADES_PATH = STATE_DIR / "active_trades.json"
 COMPLETED_TRADES_DIR = STATE_DIR / "completed_trades"
 AUTO_REPAIR_DIR = STATE_DIR / "auto_repair"
+AUTO_REPAIR_TRADE_DAY_MARKER = AUTO_REPAIR_DIR / "last_trade_log_clear_day.txt"
 DEFAULT_LOG_DIR = Path("logs")
 DEFAULT_LOG_FILE_PREFIX = "trade"
 DEFAULT_LOG_RETENTION_DAYS = 5
@@ -62,6 +65,8 @@ DEFAULT_VERBOSE_LOG_LEVEL = "DEBUG"
 CODEX_AUTOMATION_DIR = STATE_DIR / ".codex_auto"
 CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
 CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "trade_decision_output.json"
+CODEX_TRADE_MODIFIED_DAY_MARKER_PATH = CODEX_AUTOMATION_DIR / "trade_modified_day.txt"
+SHARED_CODE_UPDATE_MARKER_PATH = CODEX_AUTOMATION_DIR / "code_updated_marker.json"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -1001,28 +1006,110 @@ def _run_post_session_fetch(verbose: bool) -> None:
 def _clear_trade_auto_repair_logs(verbose: bool) -> None:
     base_dir = Path(__file__).resolve().parent
     auto_repair_path = base_dir / AUTO_REPAIR_DIR
-    if not auto_repair_path.exists():
+    marker_path = base_dir / AUTO_REPAIR_TRADE_DAY_MARKER
+    today_ist = datetime.now(INDIA_TZ).date().isoformat()
+
+    last_cleared_day: Optional[str] = None
+    try:
+        if marker_path.exists():
+            last_cleared_day = marker_path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        last_cleared_day = None
+
+    if last_cleared_day == today_ist:
         return
 
     cleared = 0
-    for path in auto_repair_path.iterdir():
-        if not path.is_file():
-            continue
-        if not path.name.startswith("trade"):
-            continue
-        try:
-            with path.open("w", encoding="utf-8"):
-                pass
-            cleared += 1
-        except OSError as exc:
-            if verbose:
-                print(f"[trade] Failed to clear auto-repair log {path}: {exc}", file=sys.stderr)
+    if auto_repair_path.exists():
+        for path in auto_repair_path.iterdir():
+            if not path.is_file():
+                continue
+            if not path.name.startswith("trade"):
+                continue
+            try:
+                with path.open("w", encoding="utf-8"):
+                    pass
+                cleared += 1
+            except OSError as exc:
+                if verbose:
+                    print(f"[trade] Failed to clear auto-repair log {path}: {exc}", file=sys.stderr)
+
+    try:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(today_ist + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to update auto-repair day marker {marker_path}: {exc}", file=sys.stderr)
 
     if verbose:
-        print(f"[trade] Cleared {cleared} trade auto-repair log file(s) in {auto_repair_path}")
+        previous = last_cleared_day or "none"
+        print(
+            f"[trade] Cleared {cleared} trade auto-repair log file(s) in {auto_repair_path} "
+            f"(day rollover: {previous} -> {today_ist})"
+        )
+
+
+def _get_today_ist_date_str() -> str:
+    return datetime.now(INDIA_TZ).date().isoformat()
+
+
+def _read_trade_codex_modified_day() -> Optional[str]:
+    path = Path(__file__).resolve().parent / CODEX_TRADE_MODIFIED_DAY_MARKER_PATH
+    try:
+        if not path.exists():
+            return None
+        value = path.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
+def _mark_trade_codex_modified_today(verbose: bool) -> None:
+    path = Path(__file__).resolve().parent / CODEX_TRADE_MODIFIED_DAY_MARKER_PATH
+    today_ist = _get_today_ist_date_str()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(today_ist + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to persist Codex modified-day marker {path}: {exc}", file=sys.stderr)
+
+
+def _read_shared_code_update_marker_fingerprint() -> Optional[str]:
+    path = Path(__file__).resolve().parent / SHARED_CODE_UPDATE_MARKER_PATH
+    try:
+        if not path.exists():
+            return None
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_shared_code_update_marker(source: str, reason: str, verbose: bool) -> None:
+    path = Path(__file__).resolve().parent / SHARED_CODE_UPDATE_MARKER_PATH
+    payload_base = {
+        "source": source,
+        "reason": reason,
+        "pid": os.getpid(),
+        "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "nonce": time.time_ns(),
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(payload_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {**payload_base, "hash": payload_hash}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to write shared code update marker {path}: {exc}", file=sys.stderr)
 
 
 def run(args: argparse.Namespace) -> None:
+    _clear_trade_auto_repair_logs(args.verbose)
+
     config = load_config()
     model = _load_model(config, args.verbose)
 
@@ -1221,6 +1308,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
     cycle_index = 0
+    seen_marker_fingerprint = _read_shared_code_update_marker_fingerprint()
 
     def _print_cycle_start(cycle_number: int, started_at: datetime) -> None:
         if args.verbose:
@@ -1252,6 +1340,15 @@ def run(args: argparse.Namespace) -> None:
 
     try:
         while True:
+            current_marker_fingerprint = _read_shared_code_update_marker_fingerprint()
+            if current_marker_fingerprint != seen_marker_fingerprint:
+                print("[trade] Shared code update marker changed; restarting process.", flush=True)
+                try:
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+                except OSError as exc:
+                    print(f"[trade] Failed to restart on shared code marker update: {exc}", file=sys.stderr)
+                    seen_marker_fingerprint = current_marker_fingerprint
+
             cycle_index += 1
             cycle_started_perf = time.perf_counter()
             now_ist = datetime.now(INDIA_TZ)
@@ -1956,23 +2053,27 @@ def run(args: argparse.Namespace) -> None:
     _run_post_session_fetch(args.verbose)
 
     if codex_cli_enabled:
-        final_completed_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
-        codex_result = _run_codex_trade_optimizer(
-            final_completed_path,
-            verbose=args.verbose,
-            timeout_seconds=codex_timeout_seconds,
-        )
-        decision = str(codex_result.get("decision", "insufficient")).strip().lower()
-        reason = str(codex_result.get("reason", "")).strip() or "no reason provided"
-        if decision == "modified":
-            print(f"[trade] End-of-day Codex applied best modification ({reason}); exiting.")
+        today_ist = _get_today_ist_date_str()
+        modified_day = _read_trade_codex_modified_day()
+        if modified_day == today_ist:
+            print("[trade] End-of-day Codex decision=skipped (already_modified_today).")
         else:
-            print(f"[trade] End-of-day Codex decision=insufficient ({reason})")
+            final_completed_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
+            codex_result = _run_codex_trade_optimizer(
+                final_completed_path,
+                verbose=args.verbose,
+                timeout_seconds=codex_timeout_seconds,
+            )
+            decision = str(codex_result.get("decision", "insufficient")).strip().lower()
+            reason = str(codex_result.get("reason", "")).strip() or "no reason provided"
+            if decision == "modified":
+                _mark_trade_codex_modified_today(args.verbose)
+                _write_shared_code_update_marker("trade", reason, args.verbose)
+                print(f"[trade] End-of-day Codex applied best modification ({reason}); exiting.")
+            else:
+                print(f"[trade] End-of-day Codex decision=insufficient ({reason})")
     else:
         print("[trade] End-of-day Codex decision=skipped (codex_cli_enabled=false).")
-
-    _clear_trade_auto_repair_logs(args.verbose)
-
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Execute live trades using the RL agent.")

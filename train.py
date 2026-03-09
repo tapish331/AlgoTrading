@@ -44,7 +44,10 @@ DEFAULT_LOG_FILE_PREFIX = "train"
 CODEX_AUTOMATION_DIR = CHECKPOINT_DIR / ".codex_auto"
 CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
 CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "decision_output.json"
-SHARED_CODE_UPDATE_MARKER_PATH = BASE_DIR / "state" / ".codex_auto" / "code_updated_marker.json"
+SHARED_CODEX_AUTOMATION_DIR = BASE_DIR / "state" / ".codex_auto"
+SHARED_CODE_UPDATE_MARKER_PATH = SHARED_CODEX_AUTOMATION_DIR / "code_updated_marker.json"
+EVIDENCE_EPOCH_STATE_PATH = SHARED_CODEX_AUTOMATION_DIR / "evidence_epoch.json"
+TRAIN_EVIDENCE_DIR = SHARED_CODEX_AUTOMATION_DIR / "train_evidence"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -166,6 +169,83 @@ def _truncate_file(path: Path, verbose: bool = False) -> None:
             print(f"[train] Failed to truncate {path}: {exc}", file=sys.stderr)
 
 
+def _coerce_epoch(value: Any) -> Optional[int]:
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return epoch
+
+
+def _write_evidence_epoch_state(epoch: int, source: str, reason: str, verbose: bool = False) -> None:
+    payload_base = {
+        "epoch": epoch,
+        "source": source,
+        "reason": reason,
+        "pid": os.getpid(),
+        "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "nonce": time.time_ns(),
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(payload_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {**payload_base, "hash": payload_hash}
+    try:
+        EVIDENCE_EPOCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        EVIDENCE_EPOCH_STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[train] Failed to write evidence epoch state {EVIDENCE_EPOCH_STATE_PATH}: {exc}", file=sys.stderr)
+
+
+def _read_evidence_epoch_payload() -> Optional[Dict[str, Any]]:
+    try:
+        if not EVIDENCE_EPOCH_STATE_PATH.exists():
+            return None
+        with EVIDENCE_EPOCH_STATE_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _get_current_evidence_epoch(verbose: bool = False) -> int:
+    payload = _read_evidence_epoch_payload()
+    epoch = _coerce_epoch((payload or {}).get("epoch"))
+    if epoch is not None:
+        return epoch
+    epoch = 1
+    _write_evidence_epoch_state(epoch, source="bootstrap", reason="initialize", verbose=verbose)
+    return epoch
+
+
+def _bump_evidence_epoch(source: str, reason: str, verbose: bool = False) -> int:
+    current = _get_current_evidence_epoch(verbose=verbose)
+    new_epoch = current + 1
+    _write_evidence_epoch_state(new_epoch, source=source, reason=reason, verbose=verbose)
+    return new_epoch
+
+
+def _resolve_train_epoch_evidence_path(epoch: int) -> Path:
+    return TRAIN_EVIDENCE_DIR / f"train_epoch_{epoch}.log"
+
+
+def _append_train_epoch_evidence_line(line: str, epoch: int, verbose: bool = False) -> None:
+    log_path = _resolve_train_epoch_evidence_path(epoch)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} | INFO | {line}\n")
+    except OSError as write_exc:
+        if verbose:
+            print(f"[train] Failed to append epoch evidence log: {write_exc}", file=sys.stderr)
+
+
 def _read_shared_code_update_marker_fingerprint() -> Optional[str]:
     path = SHARED_CODE_UPDATE_MARKER_PATH
     try:
@@ -177,11 +257,17 @@ def _read_shared_code_update_marker_fingerprint() -> Optional[str]:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _write_shared_code_update_marker(source: str, reason: str, verbose: bool = False) -> None:
+def _write_shared_code_update_marker(
+    source: str,
+    reason: str,
+    evidence_epoch: Optional[int] = None,
+    verbose: bool = False,
+) -> None:
     path = SHARED_CODE_UPDATE_MARKER_PATH
     payload_base = {
         "source": source,
         "reason": reason,
+        "evidence_epoch": _coerce_epoch(evidence_epoch),
         "pid": os.getpid(),
         "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "nonce": time.time_ns(),
@@ -199,11 +285,11 @@ def _write_shared_code_update_marker(source: str, reason: str, verbose: bool = F
 
 
 def _run_codex_log_optimizer(
-    logging_cfg: Dict[str, Any],
+    evidence_epoch: int,
     verbose: bool = False,
     timeout_seconds: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
 ) -> Dict[str, str]:
-    log_path = _resolve_train_log_path(logging_cfg)
+    log_path = _resolve_train_epoch_evidence_path(evidence_epoch)
     codex_bin = shutil.which("codex")
     if not codex_bin:
         return {"decision": "insufficient", "reason": "codex_cli_missing"}
@@ -215,11 +301,11 @@ def _run_codex_log_optimizer(
     _truncate_file(output_path, verbose=verbose)
 
     prompt = (
-        "Inspect the training loop log and decide whether one best code modification is justified now.\n"
-        f"Training log path: {log_path.resolve()}\n"
+        "Inspect the epoch-scoped training evidence log and decide whether one best code modification is justified now.\n"
+        f"Evidence epoch: {evidence_epoch}\n"
+        f"Training evidence log path: {log_path.resolve()}\n"
         "Return decision='insufficient' if evidence is not strong enough and do not edit files.\n"
         "Return decision='modified' only if you implemented exactly one best high-impact modification in this repo.\n"
-        "If decision='modified', truncate the training log file to empty after applying the change.\n"
         "Keep edits minimal, avoid destructive git operations, and do not run long training jobs.\n"
         "Always include a short reason."
     )
@@ -267,12 +353,6 @@ def _run_codex_log_optimizer(
     reason = str(payload.get("reason", ""))
     if decision not in {"insufficient", "modified"}:
         return {"decision": "insufficient", "reason": "codex_cli_unknown_decision"}
-    if decision == "modified":
-        try:
-            if log_path.exists() and log_path.stat().st_size > 0:
-                _truncate_file(log_path, verbose=verbose)
-        except OSError:
-            pass
     return {"decision": decision, "reason": reason}
 
 
@@ -439,6 +519,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + f"-p{os.getpid()}"
     iteration = 0
+    evidence_epoch = _get_current_evidence_epoch(verbose=args.verbose)
     seen_marker_fingerprint = _read_shared_code_update_marker_fingerprint()
 
     try:
@@ -451,6 +532,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 except OSError as exc:
                     print(f"[train] Failed to restart on shared code marker update: {exc}", file=sys.stderr)
                     seen_marker_fingerprint = current_marker_fingerprint
+
+            current_evidence_epoch = _get_current_evidence_epoch(verbose=args.verbose)
+            if current_evidence_epoch != evidence_epoch:
+                if args.verbose:
+                    print(
+                        f"[train] Evidence epoch changed ({evidence_epoch} -> {current_evidence_epoch}); "
+                        "switching Codex evidence stream."
+                    )
+                evidence_epoch = current_evidence_epoch
 
             iteration += 1
             if not args.verbose:
@@ -634,57 +724,61 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print("[train] Existing winner checkpoint still better; no promotion.")
 
             status_line: Optional[str] = None
-            if not args.verbose:
-                loop_runtime = time.perf_counter() - loop_start
-                current_score_num = _coerce_finite_float(promotion_score)
-                winner_score_num = _coerce_finite_float(winner_promotion_score)
-                score_delta = (
-                    current_score_num - winner_score_num
-                    if current_score_num is not None and winner_score_num is not None
-                    else None
-                )
-                win_rate_pct = (
-                    (float(current_pos_trades) / float(current_trades)) * 100.0
-                    if current_trades > 0
-                    else None
-                )
-                warn_count = 0
-                if training_records <= 0:
-                    warn_count += 1
-                if eval_records <= 0:
-                    warn_count += 1
-                if current_score_num is None:
-                    warn_count += 1
-                if not can_promote:
-                    warn_count += 1
-                if _coerce_finite_float(current_avg_reward) is None:
-                    warn_count += 1
-                if current_avg_pct_pnl is not None and _coerce_finite_float(current_avg_pct_pnl) is None:
-                    warn_count += 1
-                if current_pnl_tstat is not None and _coerce_finite_float(current_pnl_tstat) is None:
-                    warn_count += 1
-                status_line = (
-                    f"tr={_fmt_triplet(training_avg_pct_pnl, training_trades, training_pos_trades)} "
-                    f"ev={_fmt_triplet(current_avg_pct_pnl, current_trades, current_pos_trades)} "
-                    f"win={_fmt_triplet(winner_avg_pct_pnl, winner_trades, winner_pos_trades)} "
-                    f"score={promotion_metric_used}:{_fmt_float(current_score_num)}|"
-                    f"win:{_fmt_float(winner_score_num)}|"
-                    f"d:{_fmt_signed_float(score_delta)} "
-                    f"p={'Y' if should_promote else 'N'} rt={loop_runtime:.2f}s"
-                    f" data={training_records}/{eval_records} "
-                    f"evrisk={_fmt_float(current_pnl_tstat)}/{_fmt_pct(current_avg_pct_pnl)}/{_fmt_float(win_rate_pct, decimals=1, suffix='%')} "
-                    f"t={replay_train_runtime:.1f}/{train_runtime:.1f}/{replay_eval_runtime:.1f} "
-                    f"warn={warn_count}"
-                )
-                _append_train_log_line(
-                    f"run={run_id} i={iteration} {status_line}",
-                    logging_cfg,
-                    verbose=args.verbose,
-                )
+            loop_runtime = time.perf_counter() - loop_start
+            current_score_num = _coerce_finite_float(promotion_score)
+            winner_score_num = _coerce_finite_float(winner_promotion_score)
+            score_delta = (
+                current_score_num - winner_score_num
+                if current_score_num is not None and winner_score_num is not None
+                else None
+            )
+            win_rate_pct = (
+                (float(current_pos_trades) / float(current_trades)) * 100.0
+                if current_trades > 0
+                else None
+            )
+            warn_count = 0
+            if training_records <= 0:
+                warn_count += 1
+            if eval_records <= 0:
+                warn_count += 1
+            if current_score_num is None:
+                warn_count += 1
+            if not can_promote:
+                warn_count += 1
+            if _coerce_finite_float(current_avg_reward) is None:
+                warn_count += 1
+            if current_avg_pct_pnl is not None and _coerce_finite_float(current_avg_pct_pnl) is None:
+                warn_count += 1
+            if current_pnl_tstat is not None and _coerce_finite_float(current_pnl_tstat) is None:
+                warn_count += 1
+            status_line = (
+                f"tr={_fmt_triplet(training_avg_pct_pnl, training_trades, training_pos_trades)} "
+                f"ev={_fmt_triplet(current_avg_pct_pnl, current_trades, current_pos_trades)} "
+                f"win={_fmt_triplet(winner_avg_pct_pnl, winner_trades, winner_pos_trades)} "
+                f"score={promotion_metric_used}:{_fmt_float(current_score_num)}|"
+                f"win:{_fmt_float(winner_score_num)}|"
+                f"d:{_fmt_signed_float(score_delta)} "
+                f"p={'Y' if should_promote else 'N'} rt={loop_runtime:.2f}s"
+                f" data={training_records}/{eval_records} "
+                f"evrisk={_fmt_float(current_pnl_tstat)}/{_fmt_pct(current_avg_pct_pnl)}/{_fmt_float(win_rate_pct, decimals=1, suffix='%')} "
+                f"t={replay_train_runtime:.1f}/{train_runtime:.1f}/{replay_eval_runtime:.1f} "
+                f"warn={warn_count}"
+            )
+            _append_train_log_line(
+                f"run={run_id} i={iteration} {status_line}",
+                logging_cfg,
+                verbose=args.verbose,
+            )
+            _append_train_epoch_evidence_line(
+                f"run={run_id} i={iteration} {status_line}",
+                evidence_epoch,
+                verbose=args.verbose,
+            )
 
             if codex_cli_enabled:
                 codex_result = _run_codex_log_optimizer(
-                    logging_cfg=logging_cfg,
+                    evidence_epoch=evidence_epoch,
                     verbose=args.verbose,
                     timeout_seconds=codex_timeout_seconds,
                 )
@@ -699,9 +793,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if codex_result.get("decision") == "modified":
                 reason = codex_result.get("reason", "").strip() or "no reason provided"
-                _write_shared_code_update_marker("train", reason, verbose=args.verbose)
+                next_epoch = _bump_evidence_epoch("train", reason, verbose=args.verbose)
+                _write_shared_code_update_marker(
+                    "train",
+                    reason,
+                    evidence_epoch=next_epoch,
+                    verbose=args.verbose,
+                )
                 if args.verbose:
-                    print(f"[train] Codex applied best modification ({reason}); restarting process.")
+                    print(
+                        f"[train] Codex applied best modification ({reason}); "
+                        f"advanced evidence epoch to {next_epoch}; restarting process."
+                    )
                 try:
                     os.execv(sys.executable, [sys.executable, *sys.argv])
                 except OSError as exc:

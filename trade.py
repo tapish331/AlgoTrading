@@ -67,6 +67,8 @@ CODEX_DECISION_SCHEMA_PATH = CODEX_AUTOMATION_DIR / "decision_schema.json"
 CODEX_DECISION_OUTPUT_PATH = CODEX_AUTOMATION_DIR / "trade_decision_output.json"
 CODEX_TRADE_MODIFIED_DAY_MARKER_PATH = CODEX_AUTOMATION_DIR / "trade_modified_day.txt"
 SHARED_CODE_UPDATE_MARKER_PATH = CODEX_AUTOMATION_DIR / "code_updated_marker.json"
+EVIDENCE_EPOCH_STATE_PATH = CODEX_AUTOMATION_DIR / "evidence_epoch.json"
+TRADE_EVIDENCE_DIR = CODEX_AUTOMATION_DIR / "trade_evidence"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -207,9 +209,185 @@ def _truncate_file(path: Path) -> None:
         pass
 
 
-def _run_codex_trade_optimizer(
-    completed_trades_path: Path,
+def _coerce_epoch(value: Any) -> Optional[int]:
+    try:
+        epoch = int(value)
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return epoch
+
+
+def _read_evidence_epoch_payload() -> Optional[Dict[str, Any]]:
+    path = Path(__file__).resolve().parent / EVIDENCE_EPOCH_STATE_PATH
+    try:
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _write_evidence_epoch_state(epoch: int, source: str, reason: str, verbose: bool) -> None:
+    path = Path(__file__).resolve().parent / EVIDENCE_EPOCH_STATE_PATH
+    payload_base = {
+        "epoch": epoch,
+        "source": source,
+        "reason": reason,
+        "pid": os.getpid(),
+        "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "nonce": time.time_ns(),
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(payload_base, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload = {**payload_base, "hash": payload_hash}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to write evidence epoch state {path}: {exc}", file=sys.stderr)
+
+
+def _get_current_evidence_epoch(verbose: bool) -> int:
+    payload = _read_evidence_epoch_payload()
+    epoch = _coerce_epoch((payload or {}).get("epoch"))
+    if epoch is not None:
+        return epoch
+    epoch = 1
+    _write_evidence_epoch_state(epoch, source="bootstrap", reason="initialize", verbose=verbose)
+    return epoch
+
+
+def _bump_evidence_epoch(source: str, reason: str, verbose: bool) -> int:
+    current = _get_current_evidence_epoch(verbose=verbose)
+    new_epoch = current + 1
+    _write_evidence_epoch_state(new_epoch, source=source, reason=reason, verbose=verbose)
+    return new_epoch
+
+
+def _trade_epoch_cursor_path(epoch: int) -> Path:
+    return Path(__file__).resolve().parent / TRADE_EVIDENCE_DIR / f"trade_epoch_{epoch}_cursor.json"
+
+
+def _trade_epoch_evidence_path(session_day: str, epoch: int) -> Path:
+    return Path(__file__).resolve().parent / TRADE_EVIDENCE_DIR / f"trade_day_{session_day}_epoch_{epoch}.jsonl"
+
+
+def _load_trade_epoch_cursor(epoch: int) -> Dict[str, int]:
+    path = _trade_epoch_cursor_path(epoch)
+    try:
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    offsets_raw = payload.get("day_start_offsets")
+    if not isinstance(offsets_raw, dict):
+        return {}
+    offsets: Dict[str, int] = {}
+    for day, raw in offsets_raw.items():
+        if not isinstance(day, str):
+            continue
+        try:
+            offset = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if offset < 0:
+            continue
+        offsets[day] = offset
+    return offsets
+
+
+def _persist_trade_epoch_cursor(epoch: int, day_start_offsets: Dict[str, int], verbose: bool) -> None:
+    path = _trade_epoch_cursor_path(epoch)
+    payload = {
+        "epoch": epoch,
+        "day_start_offsets": dict(sorted(day_start_offsets.items())),
+        "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to persist epoch cursor {path}: {exc}", file=sys.stderr)
+
+
+def _ensure_trade_epoch_start_offset(
     *,
+    session_day: str,
+    epoch: int,
+    completed_trades_path: Path,
+    verbose: bool,
+) -> int:
+    day_start_offsets = _load_trade_epoch_cursor(epoch)
+    existing = day_start_offsets.get(session_day)
+    if existing is not None:
+        return max(existing, 0)
+
+    try:
+        start_offset = completed_trades_path.stat().st_size if completed_trades_path.exists() else 0
+    except OSError:
+        start_offset = 0
+    day_start_offsets[session_day] = max(int(start_offset), 0)
+    _persist_trade_epoch_cursor(epoch, day_start_offsets, verbose)
+    if verbose:
+        print(
+            f"[trade] Initialized epoch evidence cursor | epoch={epoch} day={session_day} "
+            f"offset={day_start_offsets[session_day]}"
+        )
+    return day_start_offsets[session_day]
+
+
+def _materialize_trade_epoch_evidence(
+    *,
+    session_day: str,
+    epoch: int,
+    completed_trades_path: Path,
+    verbose: bool,
+) -> tuple[Path, int]:
+    start_offset = _ensure_trade_epoch_start_offset(
+        session_day=session_day,
+        epoch=epoch,
+        completed_trades_path=completed_trades_path,
+        verbose=verbose,
+    )
+    evidence_path = _trade_epoch_evidence_path(session_day, epoch)
+    payload = ""
+    if completed_trades_path.exists():
+        try:
+            with completed_trades_path.open("rb") as handle:
+                handle.seek(max(start_offset, 0))
+                payload = handle.read().decode("utf-8", errors="ignore")
+        except OSError:
+            payload = ""
+    try:
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        if verbose:
+            print(f"[trade] Failed to write epoch evidence file {evidence_path}: {exc}", file=sys.stderr)
+    line_count = 0
+    if payload:
+        line_count = sum(1 for line in payload.splitlines() if line.strip())
+    return evidence_path, line_count
+
+
+def _run_codex_trade_optimizer(
+    evidence_trades_path: Path,
+    *,
+    session_day: str,
+    evidence_epoch: int,
     verbose: bool,
     timeout_seconds: float,
 ) -> Dict[str, str]:
@@ -217,10 +395,10 @@ def _run_codex_trade_optimizer(
     if not codex_bin:
         return {"decision": "insufficient", "reason": "codex_cli_missing"}
     try:
-        if not completed_trades_path.exists() or completed_trades_path.stat().st_size <= 0:
-            return {"decision": "insufficient", "reason": "completed_trades_missing_or_empty"}
+        if not evidence_trades_path.exists() or evidence_trades_path.stat().st_size <= 0:
+            return {"decision": "insufficient", "reason": "trade_evidence_missing_or_empty"}
     except OSError:
-        return {"decision": "insufficient", "reason": "completed_trades_unreadable"}
+        return {"decision": "insufficient", "reason": "trade_evidence_unreadable"}
 
     schema_path = _ensure_codex_decision_schema()
     output_path = CODEX_DECISION_OUTPUT_PATH
@@ -229,8 +407,11 @@ def _run_codex_trade_optimizer(
     except OSError as exc:
         return {"decision": "insufficient", "reason": f"codex_output_unwritable:{exc}"}
     prompt = (
-        "Inspect today's completed trades JSONL and decide whether one best code modification is justified.\n"
-        f"Today's completed trades path: {completed_trades_path.resolve()}\n"
+        "Inspect the epoch-scoped completed-trades evidence and decide whether one best code modification is justified.\n"
+        f"Session day (IST): {session_day}\n"
+        f"Evidence epoch: {evidence_epoch}\n"
+        f"Epoch-scoped completed-trades JSONL path: {evidence_trades_path.resolve()}\n"
+        "The file contains only records since the current evidence epoch started.\n"
         "Return decision='insufficient' if data is not strong enough, and do not edit files.\n"
         "Return decision='modified' only if you implemented exactly one best high-impact modification in this repo.\n"
         "Keep edits minimal, avoid destructive git operations, and do not run long live-trading loops.\n"
@@ -1086,11 +1267,17 @@ def _read_shared_code_update_marker_fingerprint() -> Optional[str]:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _write_shared_code_update_marker(source: str, reason: str, verbose: bool) -> None:
+def _write_shared_code_update_marker(
+    source: str,
+    reason: str,
+    verbose: bool,
+    evidence_epoch: Optional[int] = None,
+) -> None:
     path = Path(__file__).resolve().parent / SHARED_CODE_UPDATE_MARKER_PATH
     payload_base = {
         "source": source,
         "reason": reason,
+        "evidence_epoch": _coerce_epoch(evidence_epoch),
         "pid": os.getpid(),
         "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "nonce": time.time_ns(),
@@ -1283,6 +1470,15 @@ def run(args: argparse.Namespace) -> None:
 
     today = datetime.now(INDIA_TZ).date()
     hard_cutoff = datetime.combine(today, hard_end_time, tzinfo=INDIA_TZ)
+    evidence_epoch = _get_current_evidence_epoch(args.verbose)
+    session_day = today.isoformat()
+    session_completed_trades_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
+    _ensure_trade_epoch_start_offset(
+        session_day=session_day,
+        epoch=evidence_epoch,
+        completed_trades_path=session_completed_trades_path,
+        verbose=args.verbose,
+    )
 
     if args.verbose:
         trailing_stop_desc = f"atr(period={atr_period},mult={atr_multiplier:.4f})"
@@ -1348,6 +1544,23 @@ def run(args: argparse.Namespace) -> None:
                 except OSError as exc:
                     print(f"[trade] Failed to restart on shared code marker update: {exc}", file=sys.stderr)
                     seen_marker_fingerprint = current_marker_fingerprint
+
+            current_evidence_epoch = _get_current_evidence_epoch(args.verbose)
+            if current_evidence_epoch != evidence_epoch:
+                if args.verbose:
+                    print(
+                        f"[trade] Evidence epoch changed ({evidence_epoch} -> {current_evidence_epoch}); "
+                        "switching Codex evidence stream."
+                    )
+                evidence_epoch = current_evidence_epoch
+                session_day = _get_today_ist_date_str()
+                session_completed_trades_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
+                _ensure_trade_epoch_start_offset(
+                    session_day=session_day,
+                    epoch=evidence_epoch,
+                    completed_trades_path=session_completed_trades_path,
+                    verbose=args.verbose,
+                )
 
             cycle_index += 1
             cycle_started_perf = time.perf_counter()
@@ -2059,8 +2272,16 @@ def run(args: argparse.Namespace) -> None:
             print("[trade] End-of-day Codex decision=skipped (already_modified_today).")
         else:
             final_completed_path = _completed_trades_log_path(datetime.now(INDIA_TZ))
+            evidence_path, evidence_count = _materialize_trade_epoch_evidence(
+                session_day=today_ist,
+                epoch=evidence_epoch,
+                completed_trades_path=final_completed_path,
+                verbose=args.verbose,
+            )
             codex_result = _run_codex_trade_optimizer(
-                final_completed_path,
+                evidence_path,
+                session_day=today_ist,
+                evidence_epoch=evidence_epoch,
                 verbose=args.verbose,
                 timeout_seconds=codex_timeout_seconds,
             )
@@ -2068,10 +2289,22 @@ def run(args: argparse.Namespace) -> None:
             reason = str(codex_result.get("reason", "")).strip() or "no reason provided"
             if decision == "modified":
                 _mark_trade_codex_modified_today(args.verbose)
-                _write_shared_code_update_marker("trade", reason, args.verbose)
-                print(f"[trade] End-of-day Codex applied best modification ({reason}); exiting.")
+                next_epoch = _bump_evidence_epoch("trade", reason, args.verbose)
+                _write_shared_code_update_marker(
+                    "trade",
+                    reason,
+                    args.verbose,
+                    evidence_epoch=next_epoch,
+                )
+                print(
+                    f"[trade] End-of-day Codex applied best modification ({reason}); "
+                    f"evidence_records={evidence_count} next_epoch={next_epoch}; exiting."
+                )
             else:
-                print(f"[trade] End-of-day Codex decision=insufficient ({reason})")
+                print(
+                    f"[trade] End-of-day Codex decision=insufficient ({reason}) "
+                    f"epoch={evidence_epoch} evidence_records={evidence_count}"
+                )
     else:
         print("[trade] End-of-day Codex decision=skipped (codex_cli_enabled=false).")
 

@@ -48,6 +48,7 @@ SHARED_CODEX_AUTOMATION_DIR = BASE_DIR / "state" / ".codex_auto"
 SHARED_CODE_UPDATE_MARKER_PATH = SHARED_CODEX_AUTOMATION_DIR / "code_updated_marker.json"
 EVIDENCE_EPOCH_STATE_PATH = SHARED_CODEX_AUTOMATION_DIR / "evidence_epoch.json"
 TRAIN_EVIDENCE_DIR = SHARED_CODEX_AUTOMATION_DIR / "train_evidence"
+CODEX_GIT_SYNC_SCRIPT = BASE_DIR / "codex_git_sync.sh"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -167,6 +168,41 @@ def _truncate_file(path: Path, verbose: bool = False) -> None:
     except OSError as exc:
         if verbose:
             print(f"[train] Failed to truncate {path}: {exc}", file=sys.stderr)
+
+
+def _run_codex_git_sync(context: str, reason: str, verbose: bool = False) -> None:
+    if not CODEX_GIT_SYNC_SCRIPT.exists():
+        if verbose:
+            print(f"[train] Codex git sync script missing at {CODEX_GIT_SYNC_SCRIPT}", file=sys.stderr)
+        return
+    shell_bin = shutil.which("bash") or shutil.which("sh")
+    if not shell_bin:
+        if verbose:
+            print("[train] No shell available for Codex git sync.", file=sys.stderr)
+        return
+    cmd = [shell_bin, str(CODEX_GIT_SYNC_SCRIPT), context, reason]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[train] Codex git sync failed to start: {exc}", file=sys.stderr)
+        return
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit={completed.returncode}"
+        print(f"[train] Codex git sync failed: {detail}", file=sys.stderr)
+        return
+    if verbose:
+        stdout = (completed.stdout or "").strip()
+        if stdout:
+            print(stdout)
 
 
 def _coerce_epoch(value: Any) -> Optional[int]:
@@ -800,6 +836,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     evidence_epoch=next_epoch,
                     verbose=args.verbose,
                 )
+                _run_codex_git_sync("train", reason, verbose=args.verbose)
                 if args.verbose:
                     print(
                         f"[train] Codex applied best modification ({reason}); "

@@ -69,6 +69,7 @@ CODEX_TRADE_MODIFIED_DAY_MARKER_PATH = CODEX_AUTOMATION_DIR / "trade_modified_da
 SHARED_CODE_UPDATE_MARKER_PATH = CODEX_AUTOMATION_DIR / "code_updated_marker.json"
 EVIDENCE_EPOCH_STATE_PATH = CODEX_AUTOMATION_DIR / "evidence_epoch.json"
 TRADE_EVIDENCE_DIR = CODEX_AUTOMATION_DIR / "trade_evidence"
+CODEX_GIT_SYNC_SCRIPT = Path(__file__).resolve().parent / "codex_git_sync.sh"
 DEFAULT_CODEX_TIMEOUT_SECONDS = 180.0
 CODEX_DECISION_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -207,6 +208,41 @@ def _truncate_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8"):
         pass
+
+
+def _run_codex_git_sync(context: str, reason: str, verbose: bool = False) -> None:
+    if not CODEX_GIT_SYNC_SCRIPT.exists():
+        if verbose:
+            print(f"[trade] Codex git sync script missing at {CODEX_GIT_SYNC_SCRIPT}", file=sys.stderr)
+        return
+    shell_bin = shutil.which("bash") or shutil.which("sh")
+    if not shell_bin:
+        if verbose:
+            print("[trade] No shell available for Codex git sync.", file=sys.stderr)
+        return
+    cmd = [shell_bin, str(CODEX_GIT_SYNC_SCRIPT), context, reason]
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=300.0,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[trade] Codex git sync failed to start: {exc}", file=sys.stderr)
+        return
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit={completed.returncode}"
+        print(f"[trade] Codex git sync failed: {detail}", file=sys.stderr)
+        return
+    if verbose:
+        stdout = (completed.stdout or "").strip()
+        if stdout:
+            print(stdout)
 
 
 def _coerce_epoch(value: Any) -> Optional[int]:
@@ -2296,6 +2332,7 @@ def run(args: argparse.Namespace) -> None:
                     args.verbose,
                     evidence_epoch=next_epoch,
                 )
+                _run_codex_git_sync("trade", reason, verbose=args.verbose)
                 print(
                     f"[trade] End-of-day Codex applied best modification ({reason}); "
                     f"evidence_records={evidence_count} next_epoch={next_epoch}; exiting."
